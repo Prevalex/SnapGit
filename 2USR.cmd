@@ -1,0 +1,1 @@
+Copy /Y "%~dp0SnapGit.py" C:\USR\CMD\PYT

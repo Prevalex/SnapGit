@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     Collects tracked, untracked and ignored files from Git, filters the combined
-    list through .backupignore, and copies the remaining files while preserving
+    list through .snapignore, and copies the remaining files while preserving
     their directory structure.
 
     The three Git lists are saved as returned by Git. backup-files.txt contains
@@ -14,7 +14,7 @@
 
 .PARAMETER ProjectRoot
     Root directory of the Git project to back up. It must contain the .git
-    directory and the .gitignore and .backupignore files. The two files may be
+    directory and the .gitignore and .snapignore files. The two files may be
     empty.
 
 .PARAMETER BackupRoot
@@ -141,7 +141,7 @@ function Convert-BackupPatternToRegex {
     return $prefix + $escaped + '$'
 }
 
-function Get-BackupIgnoreRules {
+function Get-SnapIgnoreRules {
     param(
         [Parameter(Mandatory = $true)]
         [string] $Path
@@ -227,7 +227,7 @@ try {
     $requiredItems = @(
         [PSCustomObject]@{ Name = '.git';          PathType = 'Container' }
         [PSCustomObject]@{ Name = '.gitignore';    PathType = 'Leaf' }
-        [PSCustomObject]@{ Name = '.backupignore'; PathType = 'Leaf' }
+        [PSCustomObject]@{ Name = '.snapignore';   PathType = 'Leaf' }
     )
     $missingItems = New-Object System.Collections.Generic.List[string]
 
@@ -278,7 +278,7 @@ try {
         throw 'BackupRoot must be outside the Git project to prevent recursive backups.'
     }
 
-    $backupIgnorePath = Join-Path $projectRoot '.backupignore'
+    $snapIgnorePath = Join-Path $projectRoot '.snapignore'
 
     Write-Host "Project: $projectName"
     Write-Host "Root:    $projectRoot"
@@ -288,7 +288,7 @@ try {
     $untracked = @(Get-GitNullList -Arguments '-c core.quotepath=false ls-files --others --exclude-standard -z' -WorkingDirectory $projectRoot)
     $ignored = @(Get-GitNullList -Arguments '-c core.quotepath=false ls-files --others --ignored --exclude-standard -z' -WorkingDirectory $projectRoot)
 
-    $rules = @(Get-BackupIgnoreRules -Path $backupIgnorePath)
+    $rules = @(Get-SnapIgnoreRules -Path $snapIgnorePath)
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $allCandidates = New-Object System.Collections.Generic.List[string]
 
