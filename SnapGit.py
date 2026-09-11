@@ -53,7 +53,7 @@ class CompactionResult:
 @dataclass(frozen=True)
 class MonthlyCompactionResult:
     cutoff_month: str
-    compacted_project_months: int
+    compacted_months: int
     moved_snapshots: int
 
 
@@ -157,8 +157,9 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "-cd",
         action="store_true",
         help=(
-            "After a successful backup, keep only the latest snapshot for each "
-            "project and day, moving older snapshots below SnapRoot/$purge$."
+            "After a successful backup, keep only the latest snapshot for the "
+            "current project and each day, moving older snapshots below "
+            "SnapRoot/$purge$."
         ),
     )
     backup_parser.add_argument(
@@ -170,10 +171,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="MONTH_OFFSET",
         help=(
-            "For every project and every month up to the selected cutoff month, "
-            "keep only the latest snapshot. Use 0 for the current month, -1 for "
-            "the previous month, and so on. When omitted, MONTH_OFFSET defaults "
-            "to -6."
+            "For the current project and every month up to the selected cutoff "
+            "month, keep only the latest snapshot. Use 0 for the current month, "
+            "-1 for the previous month, and so on. When omitted, MONTH_OFFSET "
+            "defaults to -6."
         ),
     )
 
@@ -736,17 +737,50 @@ def move_snapshots_to_purge(
     return len(moves)
 
 
-def compact_daily_snapshots(snap_root_argument: Path) -> CompactionResult:
+def resolve_compaction_scope(
+    snap_root_argument: Path,
+    project_snapshot_path: Path,
+) -> tuple[Path, Path]:
     snap_root = snap_root_argument.expanduser().resolve(strict=False)
     if not snap_root.is_dir():
         raise SnapGitError(
             f"SnapRoot does not exist or is not a directory: {snap_root}"
         )
 
+    if (
+        project_snapshot_path.is_absolute()
+        or not project_snapshot_path.parts
+        or any(part in ("", ".", "..") for part in project_snapshot_path.parts)
+    ):
+        raise SnapGitError(
+            f"Invalid project snapshot path: {project_snapshot_path}"
+        )
+    project_snap_root = (snap_root / project_snapshot_path).resolve(strict=False)
+    if not is_same_or_within(project_snap_root, snap_root):
+        raise SnapGitError(
+            f"Project snapshot path is outside SnapRoot: {project_snap_root}"
+        )
+    if not project_snap_root.is_dir():
+        raise SnapGitError(
+            "Project snapshot directory does not exist: "
+            f"{project_snap_root}"
+        )
+    return snap_root, project_snap_root
+
+
+def compact_daily_snapshots(
+    snap_root_argument: Path,
+    project_snapshot_path: Path,
+) -> CompactionResult:
+    snap_root, project_snap_root = resolve_compaction_scope(
+        snap_root_argument,
+        project_snapshot_path,
+    )
+
     snapshots_to_move: list[Path] = []
     compacted_days = 0
 
-    for _, snapshots in find_snapshot_days(snap_root):
+    for _, snapshots in find_snapshot_days(project_snap_root):
         ordered = sorted(snapshots, key=lambda path: path.name)
         if len(ordered) <= 1:
             continue
@@ -776,26 +810,25 @@ def get_cutoff_month(month_offset: int, now: datetime | None = None) -> str:
 
 def compact_monthly_snapshots(
     snap_root_argument: Path,
+    project_snapshot_path: Path,
     month_offset: int,
     now: datetime | None = None,
 ) -> MonthlyCompactionResult:
-    snap_root = snap_root_argument.expanduser().resolve(strict=False)
-    if not snap_root.is_dir():
-        raise SnapGitError(
-            f"SnapRoot does not exist or is not a directory: {snap_root}"
-        )
+    snap_root, project_snap_root = resolve_compaction_scope(
+        snap_root_argument,
+        project_snapshot_path,
+    )
 
     cutoff_month = get_cutoff_month(month_offset, now)
-    monthly_snapshots: dict[tuple[Path, str], list[Path]] = {}
-    for date_path, snapshots in find_snapshot_days(snap_root):
+    monthly_snapshots: dict[str, list[Path]] = {}
+    for date_path, snapshots in find_snapshot_days(project_snap_root):
         snapshot_month = date_path.name[:7]
         if snapshot_month > cutoff_month:
             continue
-        group_key = (date_path.parent, snapshot_month)
-        monthly_snapshots.setdefault(group_key, []).extend(snapshots)
+        monthly_snapshots.setdefault(snapshot_month, []).extend(snapshots)
 
     snapshots_to_move: list[Path] = []
-    compacted_project_months = 0
+    compacted_months = 0
     for snapshots in monthly_snapshots.values():
         ordered = sorted(
             snapshots,
@@ -803,13 +836,13 @@ def compact_monthly_snapshots(
         )
         if len(ordered) <= 1:
             continue
-        compacted_project_months += 1
+        compacted_months += 1
         snapshots_to_move.extend(ordered[:-1])
 
     moved_snapshots = move_snapshots_to_purge(snap_root, snapshots_to_move)
     return MonthlyCompactionResult(
         cutoff_month=cutoff_month,
-        compacted_project_months=compacted_project_months,
+        compacted_months=compacted_months,
         moved_snapshots=moved_snapshots,
     )
 
@@ -1601,10 +1634,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.compact_month is not None:
             get_cutoff_month(arguments.compact_month)
 
+        project_root = resolve_project_root(arguments.project_root)
+        source_root = resolve_source_root(arguments.source_root, project_root)
+        project_snapshot_path = get_project_snapshot_path(
+            project_root,
+            source_root,
+        )
+
         result = create_backup(
-            arguments.project_root,
+            project_root,
             arguments.snap_root,
-            arguments.source_root,
+            source_root,
         )
         if result != EXIT_OK:
             if arguments.compact_day or arguments.compact_month is not None:
@@ -1615,7 +1655,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return result
 
         if arguments.compact_day:
-            compaction = compact_daily_snapshots(arguments.snap_root)
+            compaction = compact_daily_snapshots(
+                arguments.snap_root,
+                project_snapshot_path,
+            )
             print()
             print("Daily compaction complete.")
             print(f"Days compacted:  {compaction.compacted_days}")
@@ -1630,14 +1673,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.compact_month is not None:
             monthly = compact_monthly_snapshots(
                 arguments.snap_root,
+                project_snapshot_path,
                 arguments.compact_month,
             )
             print()
             print("Monthly compaction complete.")
             print(f"Cutoff month:             {monthly.cutoff_month}")
             print(
-                f"Project-months compacted: "
-                f"{monthly.compacted_project_months}"
+                f"Months compacted:         "
+                f"{monthly.compacted_months}"
             )
             print(f"Snapshots moved:          {monthly.moved_snapshots}")
             if monthly.moved_snapshots:
