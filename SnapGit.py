@@ -243,6 +243,17 @@ def normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
+def normalize_relative_path(path: str) -> str:
+    if os.name == "nt":
+        return path.replace("\\", "/")
+    return path
+
+
+def relative_path_key(path: str, *, ignore_case: bool) -> str:
+    normalized = normalize_relative_path(path)
+    return normalized.casefold() if ignore_case else normalized
+
+
 def paths_equal(first: Path, second: Path) -> bool:
     return normalized_path(first) == normalized_path(second)
 
@@ -431,7 +442,21 @@ def sanitize_remote_url(remote_url: str | None) -> str | None:
     return re.sub(r"(?i)(https?://)[^/@]+@", r"\1", remote_url)
 
 
-def get_git_snapshot_metadata(project_root: Path) -> dict[str, object]:
+def get_git_ignore_case(project_root: Path) -> bool:
+    configured = get_optional_git_text(
+        project_root,
+        "config",
+        "--bool",
+        "core.ignorecase",
+    )
+    if configured in {"true", "false"}:
+        return configured == "true"
+    return os.path.normcase("SnapGit") == os.path.normcase("snapgit")
+
+
+def get_git_snapshot_metadata(
+    project_root: Path, *, ignore_case: bool
+) -> dict[str, object]:
     staged = get_git_null_list(project_root, "diff", "--cached", "--name-only")
     unstaged = get_git_null_list(project_root, "diff", "--name-only")
     staged_deleted = get_git_null_list(
@@ -447,7 +472,11 @@ def get_git_snapshot_metadata(project_root: Path) -> dict[str, object]:
         "--name-only",
         "--diff-filter=D",
     )
-    deletion_candidates = unique_paths(staged_deleted, unstaged_deleted)
+    deletion_candidates = unique_paths(
+        staged_deleted,
+        unstaged_deleted,
+        ignore_case=ignore_case,
+    )
     deleted: list[str] = []
     for relative_path in deletion_candidates:
         _, path_parts = validate_restore_relative_path(relative_path)
@@ -467,8 +496,9 @@ def get_git_snapshot_metadata(project_root: Path) -> dict[str, object]:
         ),
         "staged": staged,
         "unstaged": unstaged,
-        "modified": unique_paths(staged, unstaged),
+        "modified": unique_paths(staged, unstaged, ignore_case=ignore_case),
         "deleted": deleted,
+        "ignore_case": ignore_case,
     }
 
 
@@ -507,6 +537,7 @@ def write_snapshot_manifest(path: Path, manifest: dict[str, object]) -> None:
         path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            errors="backslashreplace",
         )
     except (OSError, UnicodeError, TypeError) as error:
         raise SnapGitError(f"Could not write {path}: {error}") from error
@@ -521,12 +552,12 @@ def sha256_file(path: Path) -> str:
 
 
 def validate_restore_relative_path(relative_path: str) -> tuple[str, tuple[str, ...]]:
-    normalized = relative_path.replace("\\", "/")
+    normalized = normalize_relative_path(relative_path)
     parts = tuple(normalized.split("/"))
     if (
         not normalized
         or normalized.startswith("/")
-        or re.match(r"^[A-Za-z]:", normalized) is not None
+        or (os.name == "nt" and re.match(r"^[A-Za-z]:", normalized) is not None)
         or any(part in ("", ".", "..") for part in parts)
     ):
         raise SnapGitError(
@@ -536,7 +567,7 @@ def validate_restore_relative_path(relative_path: str) -> tuple[str, tuple[str, 
 
 
 def pattern_to_regex(pattern: str) -> str:
-    pattern_text = pattern.replace("\\", "/")
+    pattern_text = normalize_relative_path(pattern)
     root_anchored = pattern_text.startswith("/")
     if root_anchored:
         pattern_text = pattern_text[1:]
@@ -556,7 +587,7 @@ def pattern_to_regex(pattern: str) -> str:
     return prefix + escaped + suffix
 
 
-def read_snap_ignore(path: Path) -> list[IgnoreRule]:
+def read_snap_ignore(path: Path, *, ignore_case: bool) -> list[IgnoreRule]:
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeError) as error:
@@ -575,7 +606,8 @@ def read_snap_ignore(path: Path) -> list[IgnoreRule]:
             continue
 
         try:
-            compiled = re.compile(pattern_to_regex(line), re.IGNORECASE)
+            flags = re.IGNORECASE if ignore_case else 0
+            compiled = re.compile(pattern_to_regex(line), flags)
         except re.error as error:
             raise SnapGitError(
                 f"Invalid .snapignore pattern {raw_line!r}: {error}"
@@ -586,7 +618,7 @@ def read_snap_ignore(path: Path) -> list[IgnoreRule]:
 
 
 def is_included(relative_path: str, rules: Iterable[IgnoreRule]) -> bool:
-    path_text = relative_path.replace("\\", "/").lstrip("/")
+    path_text = normalize_relative_path(relative_path).lstrip("/")
     included = True
     for rule in rules:
         if rule.regex.search(path_text):
@@ -594,13 +626,15 @@ def is_included(relative_path: str, rules: Iterable[IgnoreRule]) -> bool:
     return included
 
 
-def unique_paths(*groups: Iterable[str]) -> list[str]:
+def unique_paths(
+    *groups: Iterable[str], ignore_case: bool
+) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for group in groups:
         for path in group:
-            normalized = path.replace("\\", "/")
-            key = normalized.casefold()
+            normalized = normalize_relative_path(path)
+            key = relative_path_key(normalized, ignore_case=ignore_case)
             if key not in seen:
                 seen.add(key)
                 result.append(normalized)
@@ -656,7 +690,7 @@ def find_snapshot_days(snap_root: Path) -> Iterable[tuple[Path, list[Path]]]:
             directory_names[:] = [
                 name
                 for name in directory_names
-                if name.casefold() != PURGE_DIRECTORY_NAME.casefold()
+                if os.path.normcase(name) != os.path.normcase(PURGE_DIRECTORY_NAME)
             ]
 
         if DATE_DIRECTORY_PATTERN.fullmatch(current.name) is None:
@@ -789,7 +823,7 @@ def copy_files(
     errors: list[str] = []
 
     for relative_path in relative_paths:
-        path_parts = relative_path.replace("\\", "/").split("/")
+        path_parts = normalize_relative_path(relative_path).split("/")
         source = project_root.joinpath(*path_parts)
         destination = content_root.joinpath(*path_parts)
 
@@ -837,16 +871,24 @@ def build_snapshot_file_entries(
     tracked: Iterable[str],
     untracked: Iterable[str],
     ignored: Iterable[str],
+    *,
+    ignore_case: bool,
 ) -> tuple[list[dict[str, object]], list[str]]:
-    tracked_keys = {path.replace("\\", "/").casefold() for path in tracked}
-    untracked_keys = {path.replace("\\", "/").casefold() for path in untracked}
-    ignored_keys = {path.replace("\\", "/").casefold() for path in ignored}
+    tracked_keys = {
+        relative_path_key(path, ignore_case=ignore_case) for path in tracked
+    }
+    untracked_keys = {
+        relative_path_key(path, ignore_case=ignore_case) for path in untracked
+    }
+    ignored_keys = {
+        relative_path_key(path, ignore_case=ignore_case) for path in ignored
+    }
     entries: list[dict[str, object]] = []
     errors: list[str] = []
 
     for raw_path in backup_files:
         relative_path, path_parts = validate_restore_relative_path(raw_path)
-        path_key = relative_path.casefold()
+        path_key = relative_path_key(relative_path, ignore_case=ignore_case)
         if path_key in tracked_keys:
             category = "tracked"
         elif path_key in untracked_keys:
@@ -903,6 +945,7 @@ def restore_extra_files(
     allow_incomplete: bool = False,
 ) -> RestoreResult:
     project_root = resolve_restore_project_root(project_root_argument)
+    ignore_case = get_git_ignore_case(project_root)
     snapshot_root = snapshot_argument.expanduser().resolve(strict=False)
     if not snapshot_root.is_dir():
         raise SnapGitError(
@@ -944,12 +987,12 @@ def restore_extra_files(
     ignored = read_utf8_line_list(snapshot_root / "ignored.lst")
     backup_files = read_utf8_line_list(snapshot_root / "backup-files.lst")
     backup_keys = {
-        path.replace("\\", "/").casefold() for path in backup_files
+        relative_path_key(path, ignore_case=ignore_case) for path in backup_files
     }
     candidates = [
         path
-        for path in unique_paths(untracked, ignored)
-        if path.replace("\\", "/").casefold() in backup_keys
+        for path in unique_paths(untracked, ignored, ignore_case=ignore_case)
+        if relative_path_key(path, ignore_case=ignore_case) in backup_keys
     ]
 
     validated_candidates: list[tuple[str, tuple[str, ...]]] = []
@@ -957,7 +1000,7 @@ def restore_extra_files(
         validated_candidates.append(validate_restore_relative_path(relative_path))
 
     tracked_keys = {
-        path.replace("\\", "/").casefold()
+        relative_path_key(path, ignore_case=ignore_case)
         for path in get_git_null_list(project_root, "ls-files")
     }
     planned_items: list[RestoreItem] = []
@@ -970,7 +1013,7 @@ def restore_extra_files(
     for relative_path, path_parts in validated_candidates:
         source = backup_root.joinpath(*path_parts)
         destination = project_root.joinpath(*path_parts)
-        path_key = relative_path.casefold()
+        path_key = relative_path_key(relative_path, ignore_case=ignore_case)
 
         if path_key in tracked_keys:
             tracked_conflicts += 1
@@ -1060,6 +1103,7 @@ def restore_full_snapshot(
     allow_incomplete: bool = False,
 ) -> FullRestoreResult:
     project_root = resolve_restore_project_root(project_root_argument)
+    ignore_case = get_git_ignore_case(project_root)
     snapshot_root = snapshot_argument.expanduser().resolve(strict=False)
     if not snapshot_root.is_dir():
         raise SnapGitError(
@@ -1149,7 +1193,7 @@ def restore_full_snapshot(
                 "snapshot.json contains an invalid file path or category."
             )
         relative_path, path_parts = validate_restore_relative_path(raw_path)
-        path_key = relative_path.casefold()
+        path_key = relative_path_key(relative_path, ignore_case=ignore_case)
         if path_key in manifest_paths:
             raise SnapGitError(
                 f"snapshot.json contains a duplicate file path: {relative_path}"
@@ -1267,7 +1311,7 @@ def restore_full_snapshot(
     ]
     duplicate_deletions: set[str] = set()
     for relative_path, _ in validated_deletions:
-        path_key = relative_path.casefold()
+        path_key = relative_path_key(relative_path, ignore_case=ignore_case)
         if path_key in duplicate_deletions:
             raise SnapGitError(
                 f"snapshot.json contains a duplicate deleted path: {relative_path}"
@@ -1382,22 +1426,34 @@ def create_backup(
         "--ignored",
         "--exclude-standard",
     )
-    git_metadata = get_git_snapshot_metadata(project_root)
+    ignore_case = get_git_ignore_case(project_root)
+    git_metadata = get_git_snapshot_metadata(
+        project_root,
+        ignore_case=ignore_case,
+    )
     deleted_keys = {
-        path.replace("\\", "/").casefold()
+        relative_path_key(path, ignore_case=ignore_case)
         for path in git_metadata["deleted"]
     }
 
-    rules = read_snap_ignore(project_root / ".snapignore")
-    candidates = unique_paths(tracked, untracked, ignored)
+    rules = read_snap_ignore(
+        project_root / ".snapignore",
+        ignore_case=ignore_case,
+    )
+    candidates = unique_paths(
+        tracked,
+        untracked,
+        ignored,
+        ignore_case=ignore_case,
+    )
     backup_files = sorted(
         (
             path
             for path in candidates
             if is_included(path, rules)
-            and path.replace("\\", "/").casefold() not in deleted_keys
+            and relative_path_key(path, ignore_case=ignore_case) not in deleted_keys
         ),
-        key=str.casefold,
+        key=lambda path: relative_path_key(path, ignore_case=ignore_case),
     )
     excluded_count = len(candidates) - len(backup_files)
 
@@ -1417,6 +1473,7 @@ def create_backup(
         tracked,
         untracked,
         ignored,
+        ignore_case=ignore_case,
     )
     all_errors = (*copy_result.errors, *metadata_errors)
     if all_errors:
