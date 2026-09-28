@@ -1,0 +1,7 @@
+include README.md CHANGELOG.md LICENSE pyproject.toml SnapGit.py test_snapgit.py
+exclude 2USR.cmd Prototype.ps1 repo_stamp.txt STATUS.md
+exclude .gitignore .snapignore
+prune .github
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod]

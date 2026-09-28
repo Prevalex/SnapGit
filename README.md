@@ -1,50 +1,131 @@
 # SnapGit
 
-SnapGit создаёт проверенные ZIP-снимки рабочего дерева Git-проекта: tracked,
-untracked и ignored файлы с независимой фильтрацией через `.snapignore`.
-Каждый снимок — самостоятельная полная копия, без зависимости от предыдущих.
+**Verified ZIP snapshots of Git working trees.** SnapGit backs up tracked,
+untracked and Git-ignored files, with independent `.snapignore` filtering.
+Each snapshot is a complete, standalone archive.
 
-## Требования
+Version **0.1.0** is a testing release. Packaging is prepared for PyPI, but no
+PyPI publication is part of this release.
 
-- Windows 10/11 или Linux, Python 3.9+ и Git в `PATH`.
-- Для запуска и переноса достаточно одного файла `SnapGit.py`.
-  `2USR.cmd` копирует его в `C:\USR\CMD\PYT`.
-- В корне исходного проекта нужны `.git` (каталог), `.gitignore` и `.snapignore`.
-  Последние два файла могут быть пустыми. Git worktree с `.git`-файлом не поддерживается.
-- Сторонние Python-библиотеки и внешние архиваторы для работы не нужны.
+## Requirements
 
-## Создание снимка
+- Python 3.9 or newer and Git available on `PATH`.
+- Windows or Linux. macOS has not been validated.
+- No third-party Python runtime dependencies or external archiver.
+- The source project must have a `.git` directory, `.gitignore` and `.snapignore`
+  at its root. The two ignore files may be empty. Linked Git worktrees with a
+  `.git` file are not supported.
+- The snapshot destination must be outside the source project.
 
-```powershell
-python .\SnapGit.py backup "D:\Projects\MyProject" -sr "E:\Backups"
+## Installation
+
+Clone this repository, then install from the checkout:
+
+```console
+git clone https://github.com/Prevalex/SnapGit.git
+cd SnapGit
+python -m pip install -e .
+snapgit --version
+snapgit --help
 ```
 
-Вместо `-sr` можно использовать `--snap-root` или переменную `SNAP_ROOT`.
-Явный параметр имеет приоритет. Путь проекта обязателен; для текущего каталога — `.`.
-Каталог бэкапов должен находиться вне исходного проекта.
+Repository access is required to clone a private repository or download its
+release assets. Editable installation uses this checkout directly: keep it in
+place, and source changes take effect without reinstalling. Reinstall after
+changing package metadata or command entry points.
 
-Чтобы повторять структуру проектов относительно общего корня:
+For an isolated installation, create and activate a virtual environment first:
+
+**Windows PowerShell**
 
 ```powershell
-$env:SNAP_SOURCE_ROOT = "D:\aLx\CodeWorks\Repos"
-$env:SNAP_ROOT = "E:\Backups"
-python .\SnapGit.py backup "D:\aLx\CodeWorks\Repos\Wrk\SnapGit"
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+snapgit --version
 ```
 
-Результат: `E:\Backups\Wrk\SnapGit\YYYY-MM-DD\HH-mm-ss.zip`.
-Явный `--source-root` имеет приоритет над `SNAP_SOURCE_ROOT`.
-Без общего корня используется `<snap-root>\<имя-проекта>`.
-Проект должен находиться внутри общего корня, но не совпадать с ним.
+**Linux**
 
-## Формат архива и совместимость
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+snapgit --version
+```
+
+Pip installs a `snapgit` command into the selected Python environment's scripts
+folder (`Scripts` on Windows, `bin` on Linux). Activating the environment puts
+that folder on `PATH`. For an installation outside a virtual environment, ensure
+the corresponding scripts folder is on `PATH`. The command then works from any
+working directory on that computer. Installation is required on each computer.
+
+If the command is not on `PATH`, use the same interpreter that installed it:
+
+```console
+python -m SnapGit --help
+```
+
+You can also install a locally built wheel without an editable checkout:
+
+```console
+python -m pip install dist/snapgit-0.1.0-py3-none-any.whl
+```
+
+The implementation remains a single file. Direct execution with
+`python SnapGit.py ...` is supported without installing the package.
+
+## Quick start
+
+In the project to back up, create a `.snapignore` file. For example:
+
+```gitignore
+.git/
+.venv*/
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.pyc
+*.tmp
+```
+
+Create a snapshot, using paths appropriate for your system:
+
+```console
+snapgit backup /path/to/project --snap-root /path/to/backups
+```
+
+On Windows, for example:
+
+```powershell
+snapgit backup "C:\Projects\MyProject" --snap-root "D:\Backups"
+```
+
+`PROJECT_ROOT` is required. Use `.` for the current directory. `--snap-root` has
+alias `-sr`; alternatively, set `SNAP_ROOT`. Explicit options override environment
+variables. SnapGit requires an existing repository and does not run Git network
+operations automatically.
+
+## Snapshot layout
 
 ```text
-<snap-root>/<путь-проекта>/YYYY-MM-DD/
+<snapshot-root>/<project>/YYYY-MM-DD/
     HH-mm-ss.zip
     HH-mm-ss.zip.sha256
 ```
 
-Внутри ZIP:
+To mirror the project hierarchy below a common source directory:
+
+```console
+snapgit backup /workspace/team/project --source-root /workspace --snap-root /backups
+```
+
+This creates snapshots below `/backups/team/project/`. `--source-root` overrides
+`SNAP_SOURCE_ROOT`. Without either, only the project's directory name is used.
+The project must be strictly inside the source root.
+
+Inside the ZIP:
 
 ```text
 snapshot.json
@@ -52,232 +133,209 @@ tracked.lst
 untracked.lst
 ignored.lst
 backup-files.lst
-backup/...                 файлы проекта с исходными относительными путями
+backup/...                 project files with their relative paths
 ```
 
-Используются стандартный **Deflate, уровень 9**, и **ZIP64** для больших файлов.
-Шифрование и Deflate64 не используются. Формат предназначен для открытия и
-распаковки в WinRAR и PKWARE SecureZIP/PKZIP 14. Проверка тестового архива
-с файлом 4 GiB + 123 байта и кириллическими именами прошла в WinRAR 7.23
-и SecureZIP 14.50.1223 (оба вернули код 0). Консольная программа `rar.exe`
-работает с RAR; для ZIP следует использовать `WinRAR.exe`.
+The manifest records the Git commit, branch, remote, selected staged/unstaged and
+deleted paths, and each file's category, size, SHA-256, permissions, modification
+time and symlink metadata. The `.lst` files are diagnostic; restore uses the
+verified manifest. Git history itself is not included.
 
-Уже сжатые форматы (`xlsx`, `xlsm`, `docx`, `pptx`, `zip`, `7z`, `rar`, `gz`,
-`jpg`, `jpeg`, `png`, `mp3`, `mp4`, `pdf`) помещаются в ZIP методом Store.
-Остальные, включая CSV, JSON и SQLite, сжимаются Deflate. Степень сжатия зависит
-от данных и может отличаться от SecureZIP с Deflate64.
+Archives use **Deflate level 9** with **ZIP64** for large files. Already compressed
+formats (`xlsx`, `xlsm`, `docx`, `pptx`, `zip`, `7z`, `rar`, `gz`, `jpg`, `jpeg`,
+`png`, `mp3`, `mp4`, `pdf`) are stored without recompression. Encryption and
+Deflate64 are not used.
 
-Версия манифеста — 2. Старые снимки-каталоги не поддерживаются и при поиске
-последнего снимка или уплотнении не учитываются. Параметр `--allow-incomplete`
-удалён: новая версия не публикует неполные снимки.
+A ZIP containing a file larger than 4 GiB and Unicode filenames was successfully
+tested with WinRAR 7.23 and PKWARE SecureZIP 14.50. Use WinRAR, rather than the
+RAR-only `rar` command, for ZIP archives.
 
-`tracked.lst`, `untracked.lst` и `ignored.lst` содержат исходные списки Git.
-`backup-files.lst` содержит выбранные пути. Это диагностические списки;
-восстановление использует проверенный `snapshot.json`, в котором находятся Git
-HEAD, ветка, remote, staged/unstaged/deleted пути, категории файлов, размеры,
-SHA-256, права, время изменения и данные символических ссылок.
+This release uses **snapshot format 2**. Legacy directory snapshots are not
+supported. Version `0.1.0` is the application version, separate from the snapshot
+format version.
 
-В Linux имена с байтами вне UTF-8 сохраняются в манифесте с JSON-экранированием,
-а соответствующие данные — под техническими именами `raw-files/<hash>`.
-SnapGit восстанавливает исходные имена в Linux. Обычная распаковка архиватором
-такие имена автоматически не восстанавливает. Символические ссылки и Unix-права
-также надёжнее восстанавливать через SnapGit.
+## Integrity verification
 
-## Контроль целостности
+**Keep each `.zip.sha256` file together with its ZIP.** SnapGit rejects a missing
+or mismatched checksum. The ZIP can still be opened by ordinary ZIP tools.
 
-При создании снимка SnapGit:
+During backup, SnapGit hashes the selected source files and writes data in
+bounded chunks, without creating an uncompressed staging copy. It verifies the
+source hashes again while writing, flushes the ZIP to disk, computes the archive
+hash, then reopens and fully reads the archive. Archive SHA-256, member CRC,
+member size/SHA-256 and manifest membership must all pass before publication.
+It also checks for source file and Git-state changes during the operation.
 
-1. Читает выбранные файлы и считает SHA-256 их содержимого. Одних размеров и дат
-   для принятия решения недостаточно.
-2. Записывает данные потоком в `.zip.partial`, повторно сверяя SHA-256 и состояние
-   исходных файлов. Промежуточная несжатая копия не создаётся.
-3. Завершает ZIP, сбрасывает его данные на диск и вычисляет SHA-256 всего архива.
-4. Повторно открывает архив, проверяет его SHA-256, состав, манифест, ZIP CRC,
-   размеры и SHA-256 всех файлов, включая данные ссылок.
-5. Проверяет, что список файлов, Git-состояние и параметры исходных файлов не
-   изменились за время работы. Только после успеха публикует `.zip.sha256` и ZIP.
+Failed or interrupted operations do not publish a complete snapshot or start
+compaction. A process or system crash may leave `.partial` files or an orphan
+checksum; these are not treated as completed snapshots.
 
-При ошибке чтения, записи, проверки или обнаруженном изменении источника новый
-ZIP не публикуется и уплотнение не запускается. При обычном завершении с ошибкой
-временные файлы удаляются; после аварии процесса/системы могут остаться `.partial`
-или одиночная контрольная сумма — они не считаются снимками.
+Verify an existing snapshot without restoring or writing its contents to disk:
 
-**Храните и переносите ZIP вместе с `.zip.sha256`.** Отсутствующая или несовпадающая
-контрольная сумма блокирует проверку и восстановление в SnapGit. Сам ZIP остаётся
-обычным архивом, который можно открыть сторонним архиватором.
-
-Проверить сохранённый снимок без восстановления:
-
-```powershell
-python .\SnapGit.py verify "E:\Backups\MyProject\2026-09-28\14-30-00.zip"
+```console
+snapgit verify /backups/project/2026-09-28/14-30-00.zip
 ```
 
-Команда полностью читает архив и распаковывает содержимое в поток проверки,
-не записывая файлы на диск. Проверяются также метаданные и состав архива.
-Перед восстановлением та же полная проверка обязательна в обоих режимах,
-включая `--dry-run`. Обычный файл назначения заменяется только после записи
-во временный файл и проверки его размера и SHA-256.
+Both restore modes, including `--dry-run`, verify the entire snapshot before
+changing the target project. Regular destination files are replaced using a
+verified temporary file.
 
-Контрольные суммы обнаруживают повреждение, но не исправляют его и не являются
-цифровой подписью. Для восстановления после физической потери данных нужны
-независимые копии. ZIP не содержит recovery record.
+Checksums detect corruption; they do not repair it or authenticate an archive's
+author. ZIP archives have no recovery record. Maintain independent copies when
+recovery from physical data loss is required.
 
-## Пропуск снимка без изменений
+## Unchanged projects
 
-Сравнение выполняется с самым поздним ZIP текущего проекта по дате и времени
-в имени. Снимки из `$purge$`, временные файлы и старый формат не участвуют.
-Последний ZIP сначала полностью проверяется.
+Before creating a snapshot, SnapGit verifies the latest ZIP for this project and
+compares it with the current selected files and Git state. Comparison includes:
 
-Учитываются:
+- File additions, removals, content hashes, permissions and symlink targets.
+- Tracked/untracked/ignored categories.
+- Git HEAD, branch, remote and selected staged/unstaged/deleted paths.
 
-- добавление и удаление выбранных файлов;
-- содержимое по SHA-256, права, цели и типы символических ссылок;
-- категории tracked/untracked/ignored;
-- Git HEAD, ветка, remote и состояние staged/unstaged/deleted выбранных путей.
+A timestamp-only change does not create another backup. Changes to excluded
+files alone do not trigger a snapshot. A new Git commit does count as a change.
 
-Одна только смена времени файла не создаёт снимок. Изменения файлов, исключённых
-через `.snapignore`, сами по себе его не создают. Новый Git commit считается
-изменением даже при одинаковом содержимом выбранных файлов.
+If nothing changed, SnapGit reports `No changes`, returns success and skips both
+backup and compaction. A damaged latest snapshot cannot justify skipping a new
+backup: SnapGit reports the problem and attempts to create a replacement.
 
-Если всё совпало, программа сообщает `No changes`, возвращает код `0` и не создаёт
-новый архив. **Уплотнение при таком запуске также пропускается.** Если последний
-ZIP повреждён или лишился контрольной суммы, программа сообщает об этом и
-пытается создать новый проверенный снимок.
+This check reads the source files and the latest archive; it deliberately does
+not rely only on sizes and timestamps.
 
-Сканирование без изменений всё равно читает исходные файлы и последний архив:
-это сознательная цена проверки содержимого и целостности.
+## Retention and compaction
 
-## Ежедневное и месячное уплотнение
+Compaction runs only after a new verified snapshot has been created. It affects
+only the current project and moves ZIP/checksum pairs to
+`<snapshot-root>/$purge$/<original-relative-path>` without deleting them.
 
-Уплотнение запускается только после создания нового проверенного снимка и
-затрагивает только текущий проект. Физического удаления нет: ZIP и его
-`.zip.sha256` перемещаются вместе в `<snap-root>/$purge$/<прежний-путь>`.
-
-**Если в архиве проекта только один ZIP-снимок, `-cd` и `-cm` не применяются.**
-Защита отдельно проверяется перед каждым видом уплотнения, в том числе когда
-после дневного уплотнения остался один снимок. Если снимков не больше `N`,
-указанного в `--keep`, уплотнение также ничего не переносит.
-
-```powershell
-python .\SnapGit.py backup "D:\Projects\MyProject" -sr "E:\Backups" -cd -cm -1
+```console
+snapgit backup /path/to/project --snap-root /backups -cd -cm -1 --keep 3
 ```
 
-- `--compact-day` / `-cd`: для каждого дня оставляет самый поздний снимок,
-  дополнительно сохраняя снимки, защищённые `--keep`.
-- `--compact-month` / `-cm`: для каждого месяца до границы включительно оставляет
-  самый поздний снимок, дополнительно сохраняя защищённые `--keep`.
-  `0` — по текущий месяц, `-1` — по предыдущий, `-2` — по
-  месяц перед предыдущим. Без числа используется `-6`. Положительные числа
-  запрещены. Путь проекта при `-cm` без числа указывайте перед параметром.
-- `--keep N` / `-k N`: защищает **N самых последних снимков текущего проекта
-  за всё время** от переноса как при `-cd`, так и при `-cm`. Это нижняя граница
-  общего числа оставшихся снимков; правила «один за день/месяц» не меняются
-  для остальных снимков. Итоговое число может быть больше N.
-  По умолчанию `1`; допустимо любое целое от `1`, без заданного верхнего предела.
-  Ноль, отрицательные и дробные значения отклоняются до начала бэкапа.
-  Если снимков не больше N, остаются все. Новый снимок входит в защищённые N.
-  Снимки из `$purge$` и других проектов не учитываются.
-  Без `-cd`/`-cm` параметр ничего не уплотняет.
-- При совместном использовании сначала выполняется дневное уплотнение,
-  затем месячное. На обоих этапах защищены те же N последних снимков за всё
-  время, включая снимки после границы `-cm`.
+- `--compact-day` / `-cd` keeps the latest snapshot of each day, plus protected
+  snapshots.
+- `--compact-month` / `-cm` keeps the latest snapshot of each eligible month,
+  plus protected snapshots. `0` includes the current month, `-1` ends with the
+  previous month, and `-2` ends with the month before that. Without a number,
+  `-cm` uses `-6`. Positive offsets are rejected. Put the project argument before
+  a bare `-cm` option.
+- `--keep N` / `-k N` protects the **N globally latest snapshots of the project**
+  from both operations. It is a minimum retained history, not a per-day or
+  per-month count and not a maximum. The default is `1`; only integers of at
+  least `1` are accepted. The newly created snapshot is included.
 
-Например, выполнить обычное дневное и месячное уплотнение (месячное — по
-предыдущий месяц включительно), сохранив как минимум три последних бэкапа
-проекта за всё время:
+If the project has at most N snapshots, none are moved. In particular, a sole
+snapshot is always protected. When both operations are requested, daily
+compaction runs first; monthly compaction preserves the same latest N snapshots.
+Snapshots after the monthly cutoff still count toward this global protection.
+Other projects, `$purge$` and legacy snapshots are excluded from the count.
 
-```powershell
-python .\SnapGit.py backup "D:\Projects\MyProject" -sr "E:\Backups" -cd -cm -1 --keep 3
+For example, with 10 snapshots in an old month and 3 in the current month,
+`-cm -1 -k 3` leaves one from the old month and all 3 current snapshots: 4 total.
+If all 10 snapshots are in a single eligible month, `-k 3` retains its latest 3.
+
+Retained snapshots in affected periods are verified before older ones are moved.
+A corrupt survivor or a destination conflict stops the operation. Existing
+`$purge$` files are never overwritten.
+
+A `.snapgit.lock` file prevents concurrent backup/compaction runs for the same
+project. After a crash, remove a stale lock only after confirming that no process
+is using that project's archive. Snapshot names have one-second resolution;
+collisions fail rather than overwrite an existing snapshot.
+
+## Restore
+
+Restore local files after cloning or updating a repository:
+
+```console
+snapgit restore /path/to/project --snapshot /backups/project/2026-09-28/14-30-00.zip --dry-run
 ```
 
-Если в старом месяце 10 снимков, а в новом — 3, то при `-cm -1 -k 3`
-старый месяц уплотняется до одного снимка, а три новых защищены. Всего остаётся
-4 снимка. Если же все 10 снимков относятся к одному обрабатываемому месяцу,
-`-k 3` сохранит три последних вместо одного.
+The default `extras` mode restores only files that were untracked or ignored in
+the snapshot. It never overwrites files currently tracked by Git. Existing local
+files are conflicts; `--overwrite` permits replacing regular local files, but not
+tracked files, directories or destination symlinks. Extras mode deletes nothing
+and does not require `.snapignore` in the target.
 
-Перед переносом старых снимков проверяются сохраняемые снимки соответствующих
-дней/месяцев. Если сохраняемый архив повреждён, перенос не начинается.
-Существующие файлы в `$purge$` не перезаписываются; конфликт останавливает операцию.
-Архивы других проектов не просматриваются.
+Remove `--dry-run` to apply the restore. To restore the saved Git commit and
+working tree instead:
 
-Параллельные backup/compaction одного проекта блокируются `.snapgit.lock`.
-После аварии блокировку можно удалить вручную, убедившись, что для этого архива
-не работает другой процесс SnapGit. Два снимка в одну секунду не перезаписываются:
-при совпадении имени нужно повторить запуск позднее.
-
-## Восстановление
-
-По умолчанию восстанавливаются только snapshot-time untracked/ignored файлы:
-
-```powershell
-python .\SnapGit.py restore "D:\Projects\MyProject" `
-    --snapshot "E:\Backups\MyProject\2026-09-28\14-30-00.zip" --dry-run
+```console
+snapgit restore /path/to/project --snapshot /backups/project/2026-09-28/14-30-00.zip --mode full --dry-run
 ```
 
-Уберите `--dry-run`, чтобы выполнить восстановление. Файлы, которые теперь
-отслеживаются Git, в режиме `extras` никогда не перезаписываются. Существующие
-локальные файлы считаются конфликтами; `--overwrite` разрешает их замену,
-но не замену tracked-файлов, каталогов и символических ссылок назначения.
-Режим ничего не удаляет и не требует `.snapignore` в новом клоне.
+Full restore requires the saved commit to be available locally and a clean target
+working tree with no untracked files. Fetch missing commits yourself. After
+verification and conflict checks, SnapGit checks out a detached HEAD, overlays
+saved files and repeats intentional tracked-file deletions. Excluded deletions
+are not applied. `--overwrite` permits replacing conflicting local files.
 
-Для полного состояния рабочего дерева:
+Full restore records but does not recreate the Git staging boundary: local
+changes are restored to the working tree after checkout.
 
-```powershell
-python .\SnapGit.py restore "D:\Projects\MyProject" `
-    --snapshot "E:\Backups\MyProject\2026-09-28\14-30-00.zip" --mode full --dry-run
+**Restore requires temporary disk space for the uncompressed snapshot**, even
+with `--dry-run`. It first verifies and stages the contents in the system temporary
+directory, then applies them. Replacing a destination file also needs room for
+its temporary copy. Failure during initial staging leaves the target unchanged.
+An error during application can result in a partial restore (exit code 2).
+
+Symbolic links may require Developer Mode or additional privileges on Windows.
+Linux names that cannot be represented safely on Windows are rejected. Non-UTF-8
+Linux names are stored using technical ZIP member names and their original names
+in the manifest; use SnapGit on Linux to restore those original names. Use SnapGit
+for restoration when file permissions and symlinks matter.
+
+## `.snapignore` rules
+
+`.gitignore` controls Git; `.snapignore` independently controls backup selection.
+A large ignored file is included unless `.snapignore` excludes it.
+
+Supported rules are blank lines, `#` comments, directory patterns (`name/`),
+root-relative patterns (`/name/`), `*` (except path separators), `**` (across
+levels), `?` and re-inclusion with `!pattern`. Later rules take precedence.
+Case sensitivity follows Git's `core.ignorecase` setting. This is a limited
+subset of `.gitignore` syntax.
+
+## Limits and exit codes
+
+A multi-file backup is not an atomic filesystem snapshot. Stop applications that
+modify the project when consistency across files matters. For a live SQLite
+database, use SQLite's backup API to obtain a consistent copy, or stop the writer.
+ZIP/hash checks do not verify database semantics or merge a WAL into its database.
+
+SnapGit does not replace Git push/fetch, Git history storage or independent
+backup copies. Uncommitted submodule contents and linked worktrees are outside
+its supported repository model.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | Success, including no changes detected |
+| `1` | Argument, Git, backup, verification or compaction error |
+| `2` | Restore conflicts or partial file-application errors |
+
+Run `snapgit backup --help`, `snapgit restore --help` or `snapgit verify --help`
+for command-specific options.
+
+## Development and local distribution builds
+
+```console
+python -m pip install -e .
+python -m unittest -v test_snapgit
+python -m pip install build twine
+python -m build
+python -m twine check dist/*
 ```
 
-Полный режим требует сохранённый Git commit в целевом репозитории и чистое рабочее
-дерево без untracked-файлов. При отсутствии commit выполните нужный `git fetch`
-самостоятельно. После проверки архива и конфликтов SnapGit переключается в
-`detached HEAD`, восстанавливает все сохранённые файлы, права и ссылки и повторяет
-намеренные удаления tracked-файлов. Исключённые через `.snapignore` удаления
-не применяются. `--overwrite` разрешает замену конфликтующих локальных файлов.
+Builds produce a source distribution and a platform-independent wheel in `dist/`.
+The wheel contains the single `SnapGit` module and its console entry point.
+The source distribution additionally contains tests and release documentation;
+local deployment helpers and internal workspace notes are excluded.
 
-Staged/unstaged пути записываются, но граница индекса Git не восстанавливается:
-локальные изменения оказываются в рабочем дереве после checkout.
+Package metadata and the CLI share the version in `SnapGit.__version__`.
+See [CHANGELOG.md](CHANGELOG.md) for release notes. These commands build and check
+artifacts locally; they do not upload anything to PyPI.
 
-Восстановление сначала распаковывает проверяемые файлы в отдельный временный
-каталог. **На диске временного каталога нужно место под несжатое содержимое
-снимка**, в том числе для `--dry-run`. Затем файлы применяются к проекту;
-для замены отдельного файла дополнительно нужно место под его временную копию.
-При нехватке места на этапе проверки целевой проект не изменяется.
-В Windows для создания символических ссылок могут потребоваться права или
-режим разработчика. Имена Linux, несовместимые с Windows, отклоняются.
+## License
 
-## Правила `.snapignore`
-
-`.gitignore` управляет Git, `.snapignore` независимо управляет составом бэкапа.
-Крупный Git-ignored файл попадёт в снимок, если не исключён через `.snapignore`.
-
-```gitignore
-.git/
-.idea/
-.vscode/
-__pycache__/
-.venv*/
-*.pyc
-*.tmp
-/local-cache/
-!important.tmp
-```
-
-Поддерживаются пустые строки, комментарии `#`, каталоги `name/`, привязка к корню
-`/name/`, `*` (кроме разделителя), `**` (включая уровни каталогов), `?` и повторное
-включение `!pattern`. Более позднее правило имеет приоритет. Регистр учитывается
-по Git `core.ignorecase`. Это ограниченное подмножество синтаксиса `.gitignore`.
-
-## Ограничения и коды завершения
-
-- Снимок не содержит историю Git и не заменяет push/fetch или clone.
-- Чтение нескольких файлов не является атомарным снимком файловой системы.
-  Для согласованности проекта остановите изменяющие его процессы.
-- Для работающей SQLite базы нужна согласованная копия через SQLite Backup API
-  либо остановка приложения. Побайтовая проверка ZIP не проверяет логическую
-  целостность базы и не объединяет SQLite WAL с основным файлом.
-- `0` — успех, включая отсутствие изменений; `1` — ошибка создания/проверки,
-  параметров, Git или уплотнения; `2` — конфликты или частичные ошибки применения
-  файлов при восстановлении.
-
-Справка: `python SnapGit.py --help`, `backup --help`, `restore --help`, `verify --help`.
-Тесты: `python -m unittest -v test_snapgit`.
+SnapGit is released under the [MIT License](LICENSE).

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snapgit"
+dynamic = ["version"]
+description = "Verified ZIP snapshots of Git working trees, including local and ignored files"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Prevalex" }]
+keywords = ["git", "backup", "snapshot", "zip", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = []
+
+[project.scripts]
+snapgit = "SnapGit:main"
+
+[project.urls]
+Repository = "https://github.com/Prevalex/SnapGit"
+Issues = "https://github.com/Prevalex/SnapGit/issues"
+Changelog = "https://github.com/Prevalex/SnapGit/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+py-modules = ["SnapGit"]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "SnapGit.__version__" }

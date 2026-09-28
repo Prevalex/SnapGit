@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import shutil
 import struct
 import subprocess
@@ -13,6 +14,7 @@ import unittest
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import SnapGit as sg
@@ -110,6 +112,21 @@ class SnapshotTests(unittest.TestCase):
         path.write_text("modified", encoding="utf-8")
         os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
         self.assertEqual(self.backup()[0], sg.EXIT_OK)
+
+    def test_executable_extensions_backup_verify_and_restore(self):
+        payloads = {"tool.cmd": b"@echo off\r\n", "tool.bat": b"echo test\r\n",
+                    "tool.exe": b"test executable payload", "tool.com": b"test COM payload"}
+        for name, data in payloads.items():
+            (self.repo / name).write_bytes(data)
+        _, archive = self.backup()
+        sg.verify_archive(archive)
+        self.assertEqual(self.backup()[0], sg.EXIT_UNCHANGED)
+        target = self.clone()
+        result = sg.restore_extra_files(target, archive)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(result.restored, len(payloads))
+        for name, data in payloads.items():
+            self.assertEqual((target / name).read_bytes(), data)
 
     def test_add_remove_and_ignored_files(self):
         self.backup()
@@ -470,7 +487,40 @@ class SnapshotTests(unittest.TestCase):
         self.assertTrue((target / "link").is_symlink())
 
 
+class StatSignatureTests(unittest.TestCase):
+    def test_windows_normalizes_only_synthetic_execute_bits(self):
+        fields = dict(st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o777,
+                      st_size=42, st_mtime_ns=123, st_ctime_ns=456)
+        before = SimpleNamespace(**fields)
+        with patch.object(sg.os, "name", "nt"):
+            expected = sg.stat_signature(before)
+            opened = SimpleNamespace(**{**fields, "st_mode": stat.S_IFREG | 0o666})
+            self.assertEqual(expected, sg.stat_signature(opened))
+            for field, value in (("st_dev", 3), ("st_ino", 3), ("st_size", 43),
+                                 ("st_mtime_ns", 124),
+                                 ("st_mode", stat.S_IFREG | 0o555),
+                                 ("st_mode", stat.S_IFLNK | 0o777)):
+                with self.subTest(field=field, value=value):
+                    changed = SimpleNamespace(**{**fields, field: value})
+                    self.assertNotEqual(expected, sg.stat_signature(changed))
+
+    def test_linux_execute_bits_and_ctime_remain_significant(self):
+        fields = dict(st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o777,
+                      st_size=42, st_mtime_ns=123, st_ctime_ns=456)
+        with patch.object(sg.os, "name", "posix"):
+            expected = sg.stat_signature(SimpleNamespace(**fields))
+            for changed in ({"st_mode": stat.S_IFREG | 0o666}, {"st_ctime_ns": 457}):
+                self.assertNotEqual(expected, sg.stat_signature(SimpleNamespace(**{**fields, **changed})))
+
+
 class KeepArgumentTests(unittest.TestCase):
+    def test_version_without_subcommand_or_project(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as caught:
+            sg.main(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "SnapGit 0.1.0")
+
     def test_default_aliases_and_large_integer(self):
         base = ["backup", ".", "-sr", "."]
         self.assertEqual(sg.parse_arguments(base).keep, 1)

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_COPY_INCOMPLETE = 2
@@ -114,8 +116,12 @@ def file_hash(path: Path) -> str:
 
 def stat_signature(value: os.stat_result) -> tuple:
     # Windows path stat and fstat disagree on legacy st_ctime in some Python
-    # versions (creation time versus change time). Content hashes remain mandatory.
-    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+    # versions (creation time versus change time). Path stat also infers execute
+    # bits from .bat/.cmd/.com/.exe names, which fstat cannot do. Ignore only those
+    # synthetic bits on Windows; preserve file type, read/write permissions,
+    # identity, size and mtime. Content hashes remain mandatory.
+    mode = value.st_mode & ~0o111 if os.name == "nt" else value.st_mode
+    return (value.st_dev, value.st_ino, mode, value.st_size,
             value.st_mtime_ns, value.st_ctime_ns if os.name != "nt" else 0)
 
 
@@ -408,6 +414,9 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description="Create and restore Git project snapshots."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"SnapGit {__version__}"
     )
     command_parsers = parser.add_subparsers(
         dest="command",
