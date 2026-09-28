@@ -12,7 +12,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+import zipfile
+import zlib
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +24,12 @@ from pathlib import Path
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_COPY_INCOMPLETE = 2
-SNAPSHOT_FORMAT_VERSION = 1
+SNAPSHOT_FORMAT_VERSION = 2
+EXIT_UNCHANGED = 3  # Internal result; CLI returns success and skips compaction.
+BLOCK_SIZE = 1024 * 1024
+STORED_SUFFIXES = {".zip", ".xlsx", ".xlsm", ".docx", ".pptx", ".7z", ".rar",
+                   ".gz", ".jpg", ".jpeg", ".png", ".mp3", ".mp4", ".pdf"}
+LIST_NAMES = {"tracked.lst", "untracked.lst", "ignored.lst", "backup-files.lst"}
 PURGE_DIRECTORY_NAME = "$purge$"
 DATE_DIRECTORY_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 TIME_DIRECTORY_PATTERN = re.compile(r"\d{2}-\d{2}-\d{2}")
@@ -34,14 +43,6 @@ class SnapGitError(RuntimeError):
 class IgnoreRule:
     include: bool
     regex: re.Pattern[str]
-
-
-@dataclass(frozen=True)
-class CopyResult:
-    copied: int
-    missing: int
-    failed: int
-    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,303 @@ class FullRestoreResult:
     deleted_files: int
     failed: int
     errors: tuple[str, ...]
+
+
+class ArchiveError(RuntimeError):
+    """An archive cannot be created or trusted."""
+
+
+def checksum_path(path: Path) -> Path:
+    return path.with_name(path.name + ".sha256")
+
+
+def stream_hash(source, destination=None) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    for block in iter(lambda: source.read(BLOCK_SIZE), b""):
+        digest.update(block)
+        size += len(block)
+        if destination is not None:
+            destination.write(block)
+    return size, digest.hexdigest()
+
+
+def file_hash(path: Path) -> str:
+    with path.open("rb") as source:
+        return stream_hash(source)[1]
+
+
+def stat_signature(value: os.stat_result) -> tuple:
+    # Windows path stat and fstat disagree on legacy st_ctime in some Python
+    # versions (creation time versus change time). Content hashes remain mandatory.
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns if os.name != "nt" else 0)
+
+
+def safe_parts(path: str) -> tuple[str, ...]:
+    if not isinstance(path, str) or "\0" in path:
+        raise ArchiveError("Invalid archive path.")
+    parts = tuple(path.split("/"))
+    if any(p in ("", ".", "..") for p in parts) or path.startswith("/"):
+        raise ArchiveError(f"Unsafe archive path: {path!r}")
+    if os.name == "nt" and any(
+        "\\" in p or ":" in p or p.endswith((" ", "."))
+        or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p)
+        for p in parts
+    ):
+        raise ArchiveError(f"Path cannot be safely restored on Windows: {path!r}")
+    if parts[0].casefold() == ".git":
+        raise ArchiveError("A snapshot must not write into .git.")
+    return parts
+
+
+def member_name(path: str) -> str:
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return "raw-files/" + hashlib.sha256(os.fsencode(path)).hexdigest()
+    return "backup/" + path
+
+
+def inspect_file(root: Path, relative: str, category: str) -> dict:
+    path = root.joinpath(*safe_parts(relative))
+    before = path.lstat()
+    link = os.readlink(path) if stat.S_ISLNK(before.st_mode) else None
+    if link is not None:
+        data = os.fsencode(link)
+        size, digest = len(data), hashlib.sha256(data).hexdigest()
+    elif stat.S_ISREG(before.st_mode):
+        with path.open("rb") as source:
+            if stat_signature(os.fstat(source.fileno())) != stat_signature(before):
+                raise ArchiveError(f"File changed while opening: {relative}")
+            size, digest = stream_hash(source)
+    else:
+        raise ArchiveError(f"Unsupported file type: {relative}")
+    if stat_signature(path.lstat()) != stat_signature(before):
+        raise ArchiveError(f"File changed while hashing: {relative}")
+    return {"path": relative, "member": member_name(relative), "category": category,
+            "copied": True, "size": size, "sha256": digest,
+            "mode": stat.S_IMODE(before.st_mode), "mtime_ns": before.st_mtime_ns,
+            "symlink_target": link,
+            "symlink_is_directory": path.is_dir() if link is not None else None,
+            "_signature": stat_signature(before)}
+
+
+def validate_manifest(manifest: object) -> dict:
+    if not isinstance(manifest, dict) or manifest.get("format_version") != SNAPSHOT_FORMAT_VERSION:
+        raise ArchiveError("Unsupported snapshot format; a version 2 ZIP is required.")
+    if manifest.get("status") != "complete":
+        raise ArchiveError("Snapshot is not complete.")
+    entries = manifest.get("files")
+    git = manifest.get("git")
+    if not isinstance(entries, list) or not isinstance(git, dict):
+        raise ArchiveError("Invalid snapshot manifest.")
+    names = set()
+    members = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ArchiveError("Invalid file entry.")
+        relative = entry.get("path")
+        safe_parts(relative)
+        key = relative.casefold() if os.name == "nt" else relative
+        if key in names:
+            raise ArchiveError(f"Duplicate snapshot path: {relative!r}")
+        names.add(key)
+        member = entry.get("member")
+        if member != member_name(relative) or member in members:
+            raise ArchiveError(f"Invalid or duplicate ZIP member: {member!r}")
+        members.add(member)
+        if (entry.get("copied") is not True
+                or entry.get("category") not in {"tracked", "untracked", "ignored"}
+                or type(entry.get("size")) is not int or entry["size"] < 0
+                or not isinstance(entry.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+                or type(entry.get("mode")) is not int or not 0 <= entry["mode"] <= 0o7777
+                or type(entry.get("mtime_ns")) is not int):
+            raise ArchiveError(f"Invalid integrity/metadata fields: {relative!r}")
+        target = entry.get("symlink_target")
+        if target is not None and (not isinstance(target, str) or "\0" in target):
+            raise ArchiveError(f"Invalid symlink: {relative!r}")
+    for name in names:
+        parts = name.split("/")
+        if any("/".join(parts[:i]) in names for i in range(1, len(parts))):
+            raise ArchiveError(f"File is also used as a parent directory: {name!r}")
+    deleted = git.get("deleted")
+    if not isinstance(deleted, list) or len(deleted) != len(set(map(str, deleted))):
+        raise ArchiveError("Invalid deleted path list.")
+    for relative in deleted:
+        safe_parts(relative)
+        key = relative.casefold() if os.name == "nt" else relative
+        if key in names:
+            raise ArchiveError(f"Path is both saved and deleted: {relative!r}")
+    return manifest
+
+
+def verify_archive(path: Path, extraction_root: Path | None = None) -> dict:
+    """Verify all bytes and members before a restore can touch its target."""
+    try:
+        expected = checksum_path(path).read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ArchiveError("Invalid archive SHA-256 file.")
+        with path.open("rb") as archive_file:
+            before = stat_signature(os.fstat(archive_file.fileno()))
+            if stream_hash(archive_file)[1] != expected:
+                raise ArchiveError(f"Archive SHA-256 mismatch: {path}")
+            archive_file.seek(0)
+            with zipfile.ZipFile(archive_file) as archive:
+                infos = archive.infolist()
+                names = [info.filename for info in infos]
+                if len(names) != len(set(names)):
+                    raise ArchiveError("Duplicate ZIP member names.")
+                if any(i.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                       or i.flag_bits & 1 or i.is_dir() for i in infos):
+                    raise ArchiveError("Unsupported ZIP member encoding.")
+                manifest = validate_manifest(json.loads(archive.read("snapshot.json")))
+                entries = manifest["files"]
+                expected_names = {"snapshot.json", *LIST_NAMES,
+                                  *(entry["member"] for entry in entries)}
+                if set(names) != expected_names:
+                    raise ArchiveError("ZIP contents do not match the manifest.")
+                # Lists are diagnostic; restoration uses the hashed manifest.
+                for name in LIST_NAMES:
+                    with archive.open(name) as source:
+                        stream_hash(source)
+                if extraction_root is not None:
+                    (extraction_root / "backup").mkdir(parents=True, exist_ok=True)
+                for entry in entries:
+                    relative = entry["path"]
+                    info = archive.getinfo(entry["member"])
+                    if info.file_size != entry["size"]:
+                        raise ArchiveError(f"Member size mismatch: {relative}")
+                    destination = None
+                    if extraction_root is not None and entry["symlink_target"] is None:
+                        destination = (extraction_root / "backup").joinpath(*safe_parts(relative))
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as source:
+                        if destination is not None:
+                            with destination.open("xb") as output:
+                                size, digest = stream_hash(source, output)
+                        else:
+                            size, digest = stream_hash(source)
+                    if size != entry["size"] or digest != entry["sha256"]:
+                        raise ArchiveError(f"Member SHA-256 mismatch: {relative}")
+                    target = entry["symlink_target"]
+                    if target is not None:
+                        data = os.fsencode(target)
+                        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                            raise ArchiveError(f"Symlink target mismatch: {relative}")
+                    elif destination is not None:
+                        os.utime(destination, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+                if stat_signature(os.fstat(archive_file.fileno())) != before:
+                    raise ArchiveError("Archive changed during verification.")
+                if extraction_root is not None:
+                    # No links exist while writing regular files to staging.
+                    for entry in entries:
+                        if entry["symlink_target"] is not None:
+                            dest = (extraction_root / "backup").joinpath(*safe_parts(entry["path"]))
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            os.symlink(entry["symlink_target"], dest,
+                                       target_is_directory=bool(entry["symlink_is_directory"]))
+                    (extraction_root / "snapshot.json").write_text(
+                        json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
+                return manifest
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError, zipfile.BadZipFile,
+            NotImplementedError, RuntimeError, EOFError, zlib.error) as error:
+        if isinstance(error, ArchiveError):
+            raise
+        raise ArchiveError(f"Could not verify {path}: {error}") from error
+
+
+def write_archive(path: Path, manifest: dict, root: Path, lists: dict,
+                  check_source) -> None:
+    """Publish the ZIP last, only after fsync and a full independent readback."""
+    temporary = path.with_name(path.name + ".partial")
+    temporary_checksum = checksum_path(temporary)
+    final_checksum = checksum_path(path)
+    published_checksum = False
+    created = False
+    checksum_created = False
+    try:
+        validate_manifest(manifest)
+        if path.exists() or final_checksum.exists():
+            raise ArchiveError(f"Snapshot already exists: {path}")
+        with temporary.open("xb") as output:
+            created = True
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED,
+                                 compresslevel=9, allowZip64=True) as archive:
+                for entry in manifest["files"]:
+                    source_path = root.joinpath(*safe_parts(entry["path"]))
+                    signature = entry["_signature"]
+                    if stat_signature(source_path.lstat()) != signature:
+                        raise ArchiveError(f"File changed before archiving: {entry['path']}")
+                    stamp = datetime.fromtimestamp(entry["mtime_ns"] / 1_000_000_000)
+                    zip_stamp = (min(2107, max(1980, stamp.year)), stamp.month,
+                                 stamp.day, stamp.hour, stamp.minute, stamp.second)
+                    info = zipfile.ZipInfo(entry["member"], date_time=zip_stamp)
+                    info.create_system = 3
+                    link = entry["symlink_target"]
+                    mode = stat.S_IFLNK if link is not None else stat.S_IFREG
+                    info.external_attr = (mode | entry["mode"]) << 16
+                    info.compress_type = (zipfile.ZIP_STORED if link is not None
+                                          or source_path.suffix.lower() in STORED_SUFFIXES
+                                          else zipfile.ZIP_DEFLATED)
+                    info._compresslevel = 9
+                    info.file_size = entry["size"]
+                    with archive.open(info, "w", force_zip64=entry["size"] >= zipfile.ZIP64_LIMIT) as dest:
+                        if link is not None:
+                            data = os.fsencode(os.readlink(source_path))
+                            dest.write(data)
+                            size, digest = len(data), hashlib.sha256(data).hexdigest()
+                        else:
+                            with source_path.open("rb") as source:
+                                if stat_signature(os.fstat(source.fileno())) != signature:
+                                    raise ArchiveError(f"File changed while opening: {entry['path']}")
+                                size, digest = stream_hash(source, dest)
+                    if (size != entry["size"] or digest != entry["sha256"]
+                            or stat_signature(source_path.lstat()) != signature):
+                        raise ArchiveError(f"File changed while archiving: {entry['path']}")
+                for name, paths in lists.items():
+                    archive.writestr(name, ("\n".join(paths) + "\n").encode("utf-8", "surrogateescape"))
+                saved_manifest = dict(manifest)
+                saved_manifest["files"] = [{k: v for k, v in e.items() if not k.startswith("_")}
+                                           for e in manifest["files"]]
+                archive.writestr("snapshot.json", json.dumps(saved_manifest, ensure_ascii=True, indent=2))
+            output.flush()
+            os.fsync(output.fileno())
+        with temporary_checksum.open("x", encoding="ascii") as output:
+            checksum_created = True
+            output.write(file_hash(temporary) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        print("Verifying ZIP CRC, file SHA-256 and archive SHA-256...")
+        verify_archive(temporary)
+        check_source()
+        if path.exists() or final_checksum.exists():
+            raise ArchiveError(f"Snapshot already exists: {path}")
+        temporary_checksum.rename(final_checksum)
+        published_checksum = True
+        temporary.rename(path)
+    except (OSError, ValueError, UnicodeError, zipfile.BadZipFile, RuntimeError) as error:
+        if isinstance(error, ArchiveError):
+            raise
+        raise ArchiveError(f"Could not create {path}: {error}") from error
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
+        if checksum_created:
+            temporary_checksum.unlink(missing_ok=True)
+        if published_checksum and not path.exists():
+            final_checksum.unlink(missing_ok=True)
+
+
+def parse_keep_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("keep count must be an integer >= 1") from error
+    if count < 1:
+        raise argparse.ArgumentTypeError("keep count must be an integer >= 1")
+    return count
 
 
 def parse_month_offset(value: str) -> int:
@@ -159,7 +457,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "After a successful backup, keep only the latest snapshot for the "
             "current project and each day, moving older snapshots below "
-            "SnapRoot/$purge$."
+            "SnapRoot/$purge$, except snapshots protected by --keep."
         ),
     )
     backup_parser.add_argument(
@@ -172,9 +470,24 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="MONTH_OFFSET",
         help=(
             "For the current project and every month up to the selected cutoff "
-            "month, keep only the latest snapshot. Use 0 for the current month, "
+            "month, keep only the latest snapshot, subject to --keep. Use 0 for the current month, "
             "-1 for the previous month, and so on. When omitted, MONTH_OFFSET "
             "defaults to -6."
+        ),
+    )
+
+    backup_parser.add_argument(
+        "--keep",
+        "-k",
+        type=parse_keep_count,
+        default=1,
+        metavar="N",
+        help=(
+            "Protect the N latest snapshots of this project across all dates "
+            "from both -cd and -cm, including the new snapshot. "
+            "This is a global minimum, not a per-period count or total maximum. "
+            "Integer >= 1; default: 1. "
+            "Has no effect without -cd or -cm."
         ),
     )
 
@@ -197,7 +510,7 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         type=Path,
         metavar="SNAPSHOT",
-        help="Snapshot directory containing backup and the .lst files.",
+        help="Snapshot ZIP file with its companion .zip.sha256 file.",
     )
     restore_parser.add_argument(
         "--mode",
@@ -222,14 +535,10 @@ def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "tracked files after checking out the saved commit."
         ),
     )
-    restore_parser.add_argument(
-        "--allow-incomplete",
-        action="store_true",
-        help=(
-            "Allow restoration from a snapshot marked incomplete or containing "
-            "copy-errors.lst."
-        ),
+    verify_parser = command_parsers.add_parser(
+        "verify", help="Fully verify a ZIP snapshot without restoring it."
     )
+    verify_parser.add_argument("snapshot", type=Path, metavar="SNAPSHOT_ZIP")
 
     arguments = parser.parse_args(raw_arguments)
     if arguments.command == "backup" and arguments.snap_root is None:
@@ -503,23 +812,13 @@ def get_git_snapshot_metadata(
     }
 
 
-def read_utf8_line_list(path: Path) -> list[str]:
-    try:
-        return path.read_text(
-            encoding="utf-8-sig",
-            errors="surrogateescape",
-        ).splitlines()
-    except (OSError, UnicodeError) as error:
-        raise SnapGitError(f"Could not read {path}: {error}") from error
-
-
 def read_snapshot_manifest(snapshot_root: Path) -> dict[str, object]:
     manifest_path = snapshot_root / "snapshot.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
         raise SnapGitError(
-            "Full restore requires snapshot.json from the new snapshot format."
+            "Verified staging directory is missing snapshot.json."
         ) from error
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise SnapGitError(f"Could not read {manifest_path}: {error}") from error
@@ -533,23 +832,32 @@ def read_snapshot_manifest(snapshot_root: Path) -> dict[str, object]:
     return manifest
 
 
-def write_snapshot_manifest(path: Path, manifest: dict[str, object]) -> None:
-    try:
-        path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            errors="backslashreplace",
-        )
-    except (OSError, UnicodeError, TypeError) as error:
-        raise SnapGitError(f"Could not write {path}: {error}") from error
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def restore_regular_file(source: Path, destination: Path, entry: dict) -> None:
+    """Check a staged replacement before atomically replacing the destination."""
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".snapgit-", dir=destination.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as original:
+            shutil.copyfileobj(original, output, 1024 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        if temporary.stat().st_size != entry["size"] or sha256_file(temporary) != entry["sha256"]:
+            raise OSError(f"Restored file failed SHA-256 verification: {destination}")
+        os.utime(temporary, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        os.chmod(temporary, entry["mode"])
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            os.chmod(temporary, 0o600)
+            temporary.unlink()
 
 
 def validate_restore_relative_path(relative_path: str) -> tuple[str, tuple[str, ...]]:
@@ -642,72 +950,52 @@ def unique_paths(
     return result
 
 
-def write_utf8_lines(path: Path, lines: Iterable[str]) -> None:
-    line_list = list(lines)
-    content = "\n".join(line_list)
-    if line_list:
-        content += "\n"
-    try:
-        path.write_text(content, encoding="utf-8", errors="surrogateescape")
-    except (OSError, UnicodeError) as error:
-        raise SnapGitError(f"Could not write {path}: {error}") from error
-
-
 def create_snapshot_root(snap_root: Path, project_snapshot_path: Path) -> Path:
     now = datetime.now()
-    snapshot_root = (
-        snap_root
-        / project_snapshot_path
-        / now.strftime("%Y-%m-%d")
-        / now.strftime("%H-%M-%S")
-    )
-    if snapshot_root.exists():
-        raise SnapGitError(
-            f"Backup destination already exists: {snapshot_root}. "
-            "Run the program again in a second."
-        )
-
-    try:
-        (snapshot_root / "backup").mkdir(parents=True, exist_ok=False)
-    except OSError as error:
-        raise SnapGitError(
-            f"Could not create backup destination {snapshot_root}: {error}"
-        ) from error
-    return snapshot_root
+    day = snap_root / project_snapshot_path / now.strftime("%Y-%m-%d")
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / (now.strftime("%H-%M-%S") + ".zip")
+    if path.exists() or checksum_path(path).exists():
+        raise SnapGitError(f"Backup destination already exists: {path}. Retry in a second.")
+    return path
 
 
-def is_snapshot_directory(path: Path) -> bool:
-    return (
-        path.is_dir()
-        and TIME_DIRECTORY_PATTERN.fullmatch(path.name) is not None
-        and (path / "backup").is_dir()
-    )
-
-
-def find_snapshot_days(snap_root: Path) -> Iterable[tuple[Path, list[Path]]]:
-    for current_text, directory_names, _ in os.walk(snap_root):
-        current = Path(current_text)
-        if paths_equal(current, snap_root):
-            directory_names[:] = [
-                name
-                for name in directory_names
-                if os.path.normcase(name) != os.path.normcase(PURGE_DIRECTORY_NAME)
-            ]
-
-        if DATE_DIRECTORY_PATTERN.fullmatch(current.name) is None:
+def find_snapshot_days(project_root: Path) -> Iterable[tuple[Path, list[Path]]]:
+    # Only immediate date directories belonging to this project; never recurse
+    # into another project's archive or $purge$.
+    if not project_root.is_dir():
+        return
+    for day in sorted(project_root.iterdir()):
+        if day.is_symlink() or not day.is_dir() or not DATE_DIRECTORY_PATTERN.fullmatch(day.name):
             continue
-
-        snapshots = [
-            current / name
-            for name in directory_names
-            if is_snapshot_directory(current / name)
-        ]
-        snapshot_names = {path.name for path in snapshots}
-        directory_names[:] = [
-            name for name in directory_names if name not in snapshot_names
-        ]
+        snapshots = [p for p in day.iterdir() if p.is_file() and not p.is_symlink()
+                     and p.suffix == ".zip" and TIME_DIRECTORY_PATTERN.fullmatch(p.stem)]
         if snapshots:
-            yield current, snapshots
+            yield day, snapshots
+
+
+def project_snapshots(project_root: Path) -> list[Path]:
+    return sorted((p for _, paths in find_snapshot_days(project_root) for p in paths),
+                  key=lambda p: (p.parent.name, p.name))
+
+
+@contextmanager
+def project_archive_lock(project_root: Path):
+    project_root.mkdir(parents=True, exist_ok=True)
+    lock = project_root / ".snapgit.lock"
+    try:
+        handle = lock.open("x", encoding="ascii")
+    except FileExistsError as error:
+        raise SnapGitError(
+            f"Project archive is locked: {lock}. If a previous run crashed, "
+            "remove this lock only after confirming no SnapGit process is running."
+        ) from error
+    try:
+        with handle:
+            handle.write(str(os.getpid()))
+        yield
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def move_snapshots_to_purge(
@@ -716,25 +1004,24 @@ def move_snapshots_to_purge(
     purge_root = snap_root / PURGE_DIRECTORY_NAME
     moves: list[tuple[Path, Path]] = []
     for snapshot in snapshots:
-        relative_path = snapshot.relative_to(snap_root)
-        destination = purge_root / relative_path
-        if destination.exists():
-            raise SnapGitError(
-                "Compaction would overwrite an existing purge snapshot: "
-                f"{destination}"
-            )
-        moves.append((snapshot, destination))
-
-    for snapshot, destination in moves:
-        try:
+        for source in (snapshot, checksum_path(snapshot)):
+            destination = purge_root / source.relative_to(snap_root)
+            if destination.exists():
+                raise SnapGitError(f"Compaction would overwrite a purge file: {destination}")
+            if not source.is_file():
+                raise SnapGitError(f"Compaction requires the archive and checksum: {source}")
+            moves.append((source, destination))
+    completed = []
+    try:
+        for source, destination in moves:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            snapshot.rename(destination)
-        except OSError as error:
-            raise SnapGitError(
-                f"Could not move snapshot {snapshot} to {destination}: {error}"
-            ) from error
-
-    return len(moves)
+            source.rename(destination)
+            completed.append((source, destination))
+    except OSError as error:
+        for source, destination in reversed(completed):
+            destination.rename(source)
+        raise SnapGitError(f"Could not compact snapshots: {error}") from error
+    return len(moves) // 2
 
 
 def resolve_compaction_scope(
@@ -771,23 +1058,37 @@ def resolve_compaction_scope(
 def compact_daily_snapshots(
     snap_root_argument: Path,
     project_snapshot_path: Path,
+    *,
+    keep: int = 1,
 ) -> CompactionResult:
+    if type(keep) is not int or keep < 1:
+        raise SnapGitError("Keep count must be an integer >= 1.")
     snap_root, project_snap_root = resolve_compaction_scope(
         snap_root_argument,
         project_snapshot_path,
     )
 
+    all_snapshots = project_snapshots(project_snap_root)
+    if len(all_snapshots) <= keep:
+        print(f"Compaction skipped: the project has at most {keep} snapshots.")
+        return CompactionResult(0, 0)
+    protected = set(all_snapshots[-keep:])
     snapshots_to_move: list[Path] = []
+    survivors: list[Path] = []
     compacted_days = 0
 
     for _, snapshots in find_snapshot_days(project_snap_root):
         ordered = sorted(snapshots, key=lambda path: path.name)
-        if len(ordered) <= 1:
+        to_move = [path for path in ordered[:-1] if path not in protected]
+        if not to_move:
             continue
 
         compacted_days += 1
-        snapshots_to_move.extend(ordered[:-1])
+        survivors.extend(path for path in ordered if path == ordered[-1] or path in protected)
+        snapshots_to_move.extend(to_move)
 
+    for survivor in survivors:
+        verify_archive(survivor)
     moved_snapshots = move_snapshots_to_purge(snap_root, snapshots_to_move)
 
     return CompactionResult(
@@ -813,13 +1114,22 @@ def compact_monthly_snapshots(
     project_snapshot_path: Path,
     month_offset: int,
     now: datetime | None = None,
+    *,
+    keep: int = 1,
 ) -> MonthlyCompactionResult:
+    if type(keep) is not int or keep < 1:
+        raise SnapGitError("Keep count must be an integer >= 1.")
     snap_root, project_snap_root = resolve_compaction_scope(
         snap_root_argument,
         project_snapshot_path,
     )
 
     cutoff_month = get_cutoff_month(month_offset, now)
+    all_snapshots = project_snapshots(project_snap_root)
+    if len(all_snapshots) <= keep:
+        print(f"Compaction skipped: the project has at most {keep} snapshots.")
+        return MonthlyCompactionResult(cutoff_month, 0, 0)
+    protected = set(all_snapshots[-keep:])
     monthly_snapshots: dict[str, list[Path]] = {}
     for date_path, snapshots in find_snapshot_days(project_snap_root):
         snapshot_month = date_path.name[:7]
@@ -829,16 +1139,21 @@ def compact_monthly_snapshots(
 
     snapshots_to_move: list[Path] = []
     compacted_months = 0
+    survivors: list[Path] = []
     for snapshots in monthly_snapshots.values():
         ordered = sorted(
             snapshots,
             key=lambda path: (path.parent.name, path.name),
         )
-        if len(ordered) <= 1:
+        to_move = [path for path in ordered[:-1] if path not in protected]
+        if not to_move:
             continue
         compacted_months += 1
-        snapshots_to_move.extend(ordered[:-1])
+        survivors.extend(path for path in ordered if path == ordered[-1] or path in protected)
+        snapshots_to_move.extend(to_move)
 
+    for survivor in survivors:
+        verify_archive(survivor)
     moved_snapshots = move_snapshots_to_purge(snap_root, snapshots_to_move)
     return MonthlyCompactionResult(
         cutoff_month=cutoff_month,
@@ -847,135 +1162,12 @@ def compact_monthly_snapshots(
     )
 
 
-def copy_files(
-    project_root: Path, content_root: Path, relative_paths: Iterable[str]
-) -> CopyResult:
-    copied = 0
-    missing = 0
-    failed = 0
-    errors: list[str] = []
-
-    for relative_path in relative_paths:
-        path_parts = normalize_relative_path(relative_path).split("/")
-        source = project_root.joinpath(*path_parts)
-        destination = content_root.joinpath(*path_parts)
-
-        try:
-            source_is_symlink = source.is_symlink()
-            source_is_file = source.is_file()
-        except OSError as error:
-            failed += 1
-            errors.append(f"FAILED: {relative_path} :: {error}")
-            continue
-
-        if not source_is_file and not source_is_symlink:
-            missing += 1
-            errors.append(f"MISSING: {relative_path}")
-            continue
-
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if source_is_symlink:
-                link_target = os.readlink(source)
-                os.symlink(
-                    link_target,
-                    destination,
-                    target_is_directory=source.is_dir(),
-                )
-            else:
-                shutil.copy2(source, destination, follow_symlinks=True)
-            copied += 1
-        except OSError as error:
-            failed += 1
-            errors.append(f"FAILED: {relative_path} :: {error}")
-
-    return CopyResult(
-        copied=copied,
-        missing=missing,
-        failed=failed,
-        errors=tuple(errors),
-    )
-
-
-def build_snapshot_file_entries(
-    project_root: Path,
-    content_root: Path,
-    backup_files: Iterable[str],
-    tracked: Iterable[str],
-    untracked: Iterable[str],
-    ignored: Iterable[str],
-    *,
-    ignore_case: bool,
-) -> tuple[list[dict[str, object]], list[str]]:
-    tracked_keys = {
-        relative_path_key(path, ignore_case=ignore_case) for path in tracked
-    }
-    untracked_keys = {
-        relative_path_key(path, ignore_case=ignore_case) for path in untracked
-    }
-    ignored_keys = {
-        relative_path_key(path, ignore_case=ignore_case) for path in ignored
-    }
-    entries: list[dict[str, object]] = []
-    errors: list[str] = []
-
-    for raw_path in backup_files:
-        relative_path, path_parts = validate_restore_relative_path(raw_path)
-        path_key = relative_path_key(relative_path, ignore_case=ignore_case)
-        if path_key in tracked_keys:
-            category = "tracked"
-        elif path_key in untracked_keys:
-            category = "untracked"
-        elif path_key in ignored_keys:
-            category = "ignored"
-        else:
-            category = "unknown"
-
-        source = project_root.joinpath(*path_parts)
-        archived = content_root.joinpath(*path_parts)
-        entry: dict[str, object] = {
-            "path": relative_path,
-            "category": category,
-            "copied": False,
-            "size": None,
-            "sha256": None,
-            "mode": None,
-            "symlink_target": None,
-            "symlink_is_directory": None,
-        }
-
-        try:
-            archived_is_symlink = archived.is_symlink()
-            archived_is_file = archived.is_file()
-            if not archived_is_symlink and not archived_is_file:
-                entries.append(entry)
-                continue
-
-            entry["copied"] = True
-            source_status = source.lstat()
-            entry["mode"] = stat.S_IMODE(source_status.st_mode)
-            if source.is_symlink():
-                entry["symlink_target"] = os.readlink(source)
-                entry["symlink_is_directory"] = source.is_dir()
-            else:
-                archived_status = archived.stat()
-                entry["size"] = archived_status.st_size
-                entry["sha256"] = sha256_file(archived)
-        except (OSError, UnicodeError) as error:
-            entry["copied"] = False
-            errors.append(f"FAILED-METADATA: {relative_path} :: {error}")
-        entries.append(entry)
-
-    return entries, errors
-
-
-def restore_extra_files(
+def _restore_extra_files(
     project_root_argument: Path,
     snapshot_argument: Path,
     *,
     dry_run: bool = False,
     overwrite: bool = False,
-    allow_incomplete: bool = False,
 ) -> RestoreResult:
     project_root = resolve_restore_project_root(project_root_argument)
     ignore_case = get_git_ignore_case(project_root)
@@ -987,46 +1179,11 @@ def restore_extra_files(
     if is_same_or_within(snapshot_root, project_root):
         raise SnapGitError("Snapshot must be outside the restore target project.")
 
-    required_items = (
-        "tracked.lst",
-        "untracked.lst",
-        "ignored.lst",
-        "backup-files.lst",
-    )
-    missing_items = [
-        name for name in required_items if not (snapshot_root / name).is_file()
-    ]
+    manifest = read_snapshot_manifest(snapshot_root)
     backup_root = snapshot_root / "backup"
-    if not backup_root.is_dir():
-        missing_items.append("backup [directory]")
-    if missing_items:
-        raise SnapGitError(
-            "Snapshot is missing required items: " + ", ".join(missing_items)
-        )
-
-    copy_errors_path = snapshot_root / "copy-errors.lst"
-    if copy_errors_path.exists() and not allow_incomplete:
-        raise SnapGitError(
-            "Snapshot is incomplete because copy-errors.lst exists. "
-            "Use --allow-incomplete to restore the files that are available."
-        )
-    if copy_errors_path.exists():
-        print(
-            f"WARNING: Restoring from an incomplete snapshot: {copy_errors_path}",
-            file=sys.stderr,
-        )
-
-    untracked = read_utf8_line_list(snapshot_root / "untracked.lst")
-    ignored = read_utf8_line_list(snapshot_root / "ignored.lst")
-    backup_files = read_utf8_line_list(snapshot_root / "backup-files.lst")
-    backup_keys = {
-        relative_path_key(path, ignore_case=ignore_case) for path in backup_files
-    }
-    candidates = [
-        path
-        for path in unique_paths(untracked, ignored, ignore_case=ignore_case)
-        if relative_path_key(path, ignore_case=ignore_case) in backup_keys
-    ]
+    entries = {entry["path"]: entry for entry in manifest["files"]}
+    candidates = [path for path, entry in entries.items()
+                  if entry["category"] in {"untracked", "ignored"}]
 
     validated_candidates: list[tuple[str, tuple[str, ...]]] = []
     for relative_path in candidates:
@@ -1054,7 +1211,7 @@ def restore_extra_files(
             continue
 
         try:
-            source_is_file = source.is_file()
+            source_is_file = source.is_file() or source.is_symlink()
         except OSError as error:
             failed += 1
             errors.append(f"FAILED: {relative_path} :: {error}")
@@ -1065,7 +1222,7 @@ def restore_extra_files(
             continue
 
         try:
-            resolved_source = source.resolve(strict=True)
+            resolved_source = source.parent.resolve(strict=True) / source.name
             resolved_destination = destination.resolve(strict=False)
         except OSError as error:
             failed += 1
@@ -1109,7 +1266,14 @@ def restore_extra_files(
         for item in planned_items:
             try:
                 item.destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item.source, item.destination, follow_symlinks=True)
+                entry = entries[item.relative_path]
+                if entry["symlink_target"] is not None:
+                    if os.path.lexists(item.destination):
+                        item.destination.unlink()
+                    os.symlink(entry["symlink_target"], item.destination,
+                               target_is_directory=bool(entry["symlink_is_directory"]))
+                else:
+                    restore_regular_file(item.source, item.destination, entry)
                 restored += 1
             except OSError as error:
                 failed += 1
@@ -1127,13 +1291,12 @@ def restore_extra_files(
     )
 
 
-def restore_full_snapshot(
+def _restore_full_snapshot(
     project_root_argument: Path,
     snapshot_argument: Path,
     *,
     dry_run: bool = False,
     overwrite: bool = False,
-    allow_incomplete: bool = False,
 ) -> FullRestoreResult:
     project_root = resolve_restore_project_root(project_root_argument)
     ignore_case = get_git_ignore_case(project_root)
@@ -1146,18 +1309,6 @@ def restore_full_snapshot(
         raise SnapGitError("Snapshot must be outside the restore target project.")
 
     manifest = read_snapshot_manifest(snapshot_root)
-    manifest_status = manifest.get("status")
-    if manifest_status != "complete" and not allow_incomplete:
-        raise SnapGitError(
-            f"Snapshot status is {manifest_status!r}. "
-            "Use --allow-incomplete to restore the files that are available."
-        )
-    if manifest_status != "complete":
-        print(
-            f"WARNING: Restoring a snapshot with status {manifest_status!r}.",
-            file=sys.stderr,
-        )
-
     git_metadata = manifest.get("git")
     file_entries = manifest.get("files")
     if not isinstance(git_metadata, dict) or not isinstance(file_entries, list):
@@ -1375,6 +1526,8 @@ def restore_full_snapshot(
     errors: list[str] = []
     for item, entry in planned_items:
         try:
+            if not is_same_or_within(item.destination.parent.resolve(), project_root):
+                raise OSError("Destination parent resolves outside ProjectRoot after checkout")
             item.destination.parent.mkdir(parents=True, exist_ok=True)
             symlink_target = entry.get("symlink_target")
             if symlink_target is not None:
@@ -1388,10 +1541,7 @@ def restore_full_snapshot(
             else:
                 if item.destination.is_symlink():
                     item.destination.unlink()
-                shutil.copy2(item.source, item.destination, follow_symlinks=True)
-                saved_mode = entry.get("mode")
-                if isinstance(saved_mode, int) and 0 <= saved_mode <= 0o7777:
-                    os.chmod(item.destination, saved_mode)
+                restore_regular_file(item.source, item.destination, entry)
             restored_files += 1
         except OSError as error:
             failed += 1
@@ -1425,135 +1575,115 @@ def restore_full_snapshot(
     )
 
 
-def create_backup(
-    project_root_argument: Path,
-    snap_root_argument: Path,
-    source_root_argument: Path | None = None,
-) -> int:
+def restore_extra_files(project_root_argument: Path, snapshot_argument: Path, **options) -> RestoreResult:
+    return restore_verified(project_root_argument, snapshot_argument, full=False, **options)
+
+
+def restore_full_snapshot(project_root_argument: Path, snapshot_argument: Path, **options) -> FullRestoreResult:
+    return restore_verified(project_root_argument, snapshot_argument, full=True, **options)
+
+
+def restore_verified(project: Path, snapshot: Path, *, full: bool, **options):
+    project = resolve_restore_project_root(project)
+    snapshot = snapshot.expanduser().resolve(strict=True)
+    if not snapshot.is_file() or snapshot.suffix.lower() != ".zip":
+        raise SnapGitError("Restore requires a ZIP snapshot, not a legacy directory.")
+    if is_same_or_within(snapshot, project):
+        raise SnapGitError("Snapshot must be outside the restore target project.")
+    print("Verifying the entire snapshot before restoring...")
+    # A private staging directory keeps unverified bytes away from the project.
+    # It also permits full validation before checkout changes the target tree.
+    with tempfile.TemporaryDirectory(prefix="snapgit-restore-") as temporary:
+        root = Path(temporary)
+        verify_archive(snapshot, root)
+        restore = _restore_full_snapshot if full else _restore_extra_files
+        return restore(project, root, **options)
+
+
+def collect_project(project_root: Path) -> tuple[dict, dict, dict]:
+    ignore_case = get_git_ignore_case(project_root)
+    tracked = get_git_null_list(project_root, "ls-files")
+    untracked = get_git_null_list(project_root, "ls-files", "--others", "--exclude-standard")
+    ignored = get_git_null_list(project_root, "ls-files", "--others", "--ignored", "--exclude-standard")
+    git_metadata = get_git_snapshot_metadata(project_root, ignore_case=ignore_case)
+    rules = read_snap_ignore(project_root / ".snapignore", ignore_case=ignore_case)
+    # Excluded paths must not trigger snapshots through Git status metadata.
+    for key in ("staged", "unstaged", "modified", "deleted"):
+        git_metadata[key] = sorted(p for p in git_metadata[key] if is_included(p, rules))
+    deleted_keys = {relative_path_key(p, ignore_case=ignore_case) for p in git_metadata["deleted"]}
+    categories = {}
+    for category, paths in (("tracked", tracked), ("untracked", untracked), ("ignored", ignored)):
+        for path in paths:
+            if is_included(path, rules) and relative_path_key(path, ignore_case=ignore_case) not in deleted_keys:
+                categories.setdefault(path, category)
+    categories = dict(sorted(categories.items()))
+    return git_metadata, categories, {
+        "tracked.lst": tracked, "untracked.lst": untracked,
+        "ignored.lst": ignored, "backup-files.lst": list(categories),
+    }
+
+
+def snapshot_identity(manifest: dict) -> dict:
+    fields = ("path", "category", "size", "sha256", "mode", "symlink_target", "symlink_is_directory")
+    return {"git": manifest["git"],
+            "files": [{key: entry[key] for key in fields} for entry in manifest["files"]]}
+
+
+def create_backup(project_root_argument: Path, snap_root_argument: Path,
+                  source_root_argument: Path | None = None) -> int:
     project_root = resolve_project_root(project_root_argument)
     source_root = resolve_source_root(source_root_argument, project_root)
-    project_snapshot_path = get_project_snapshot_path(project_root, source_root)
-    snap_root = resolve_snap_root(
-        snap_root_argument,
-        project_root,
-        project_snapshot_path,
-    )
-    project_name = project_root.name
-    if not project_name:
-        raise SnapGitError(f"Could not determine the project name from {project_root}.")
-
-    print(f"Project: {project_name}")
-    print(f"Root:    {project_root}")
-    if source_root is not None:
-        print(f"Layout:  {project_snapshot_path}")
-    print("Reading file lists from Git...")
-
-    tracked = get_git_null_list(project_root, "ls-files")
-    untracked = get_git_null_list(
-        project_root, "ls-files", "--others", "--exclude-standard"
-    )
-    ignored = get_git_null_list(
-        project_root,
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-    )
-    ignore_case = get_git_ignore_case(project_root)
-    git_metadata = get_git_snapshot_metadata(
-        project_root,
-        ignore_case=ignore_case,
-    )
-    deleted_keys = {
-        relative_path_key(path, ignore_case=ignore_case)
-        for path in git_metadata["deleted"]
-    }
-
-    rules = read_snap_ignore(
-        project_root / ".snapignore",
-        ignore_case=ignore_case,
-    )
-    candidates = unique_paths(
-        tracked,
-        untracked,
-        ignored,
-        ignore_case=ignore_case,
-    )
-    backup_files = sorted(
-        (
-            path
-            for path in candidates
-            if is_included(path, rules)
-            and relative_path_key(path, ignore_case=ignore_case) not in deleted_keys
-        ),
-        key=lambda path: relative_path_key(path, ignore_case=ignore_case),
-    )
-    excluded_count = len(candidates) - len(backup_files)
-
-    snapshot_root = create_snapshot_root(snap_root, project_snapshot_path)
-    content_root = snapshot_root / "backup"
-
-    write_utf8_lines(snapshot_root / "tracked.lst", tracked)
-    write_utf8_lines(snapshot_root / "untracked.lst", untracked)
-    write_utf8_lines(snapshot_root / "ignored.lst", ignored)
-    write_utf8_lines(snapshot_root / "backup-files.lst", backup_files)
-
-    copy_result = copy_files(project_root, content_root, backup_files)
-    file_entries, metadata_errors = build_snapshot_file_entries(
-        project_root,
-        content_root,
-        backup_files,
-        tracked,
-        untracked,
-        ignored,
-        ignore_case=ignore_case,
-    )
-    all_errors = (*copy_result.errors, *metadata_errors)
-    if all_errors:
-        write_utf8_lines(snapshot_root / "copy-errors.lst", all_errors)
-
-    manifest: dict[str, object] = {
-        "format_version": SNAPSHOT_FORMAT_VERSION,
+    project_path = get_project_snapshot_path(project_root, source_root)
+    snap_root = resolve_snap_root(snap_root_argument, project_root, project_path)
+    print(f"Project: {project_root}")
+    print("Reading and hashing selected files...")
+    git_metadata, categories, lists = collect_project(project_root)
+    entries = [inspect_file(project_root, path, category) for path, category in categories.items()]
+    manifest = {
+        "format_version": SNAPSHOT_FORMAT_VERSION, "status": "complete",
         "created_at": datetime.now().astimezone().isoformat(),
-        "status": "incomplete" if all_errors else "complete",
-        "project": {
-            "name": project_name,
-            "relative_path": project_snapshot_path.as_posix(),
-            "source_root": str(source_root) if source_root is not None else None,
-            "original_root": str(project_root),
-        },
-        "git": git_metadata,
-        "files": file_entries,
-        "copy_errors": list(all_errors),
+        "project": {"name": project_root.name, "relative_path": project_path.as_posix(),
+                    "source_root": str(source_root) if source_root else None,
+                    "original_root": str(project_root)},
+        "git": git_metadata, "files": entries,
     }
-    write_snapshot_manifest(snapshot_root / "snapshot.json", manifest)
 
-    print()
-    print("Backup complete.")
-    print(f"Destination: {snapshot_root}")
-    print(f"Tracked:    {len(tracked)}")
-    print(f"Untracked:  {len(untracked)}")
-    print(f"Ignored:    {len(ignored)}")
-    print(f"Unique:     {len(candidates)}")
-    print(f"Excluded:   {excluded_count}")
-    print(f"Selected:   {len(backup_files)}")
-    print(f"Copied:     {copy_result.copied}")
-    print(f"Missing:    {copy_result.missing}")
-    print(f"Failed:     {copy_result.failed + len(metadata_errors)}")
+    def check_source():
+        current_git, current_categories, _ = collect_project(project_root)
+        if current_git != git_metadata or current_categories != categories:
+            raise ArchiveError("Project file list or Git state changed during backup. Retry when idle.")
+        for entry in entries:
+            source = project_root.joinpath(*safe_parts(entry["path"]))
+            if stat_signature(source.lstat()) != entry["_signature"]:
+                raise ArchiveError(f"File changed during backup: {entry['path']}. Retry when idle.")
 
-    if copy_result.missing or copy_result.failed or metadata_errors:
-        print(
-            f"WARNING: Some files were not copied. See: "
-            f"{snapshot_root / 'copy-errors.lst'}",
-            file=sys.stderr,
-        )
-        return EXIT_COPY_INCOMPLETE
+    previous = project_snapshots(snap_root / project_path)
+    if previous:
+        print(f"Verifying latest snapshot: {previous[-1]}")
+        try:
+            latest = verify_archive(previous[-1])
+        except ArchiveError as error:
+            print(f"WARNING: Latest snapshot is not usable: {error}. Creating a replacement.", file=sys.stderr)
+        else:
+            if snapshot_identity(latest) == snapshot_identity(manifest):
+                check_source()
+                print("No changes: verified latest snapshot matches the project. Backup and compaction skipped.")
+                return EXIT_UNCHANGED
+    destination = create_snapshot_root(snap_root, project_path)
+    print(f"Writing ZIP: {destination}")
+    write_archive(destination, manifest, project_root, lists, check_source)
+    print(f"Backup verified: {destination}")
+    print(f"Files: {len(entries)}; source bytes: {sum(e['size'] for e in entries)}; ZIP bytes: {destination.stat().st_size}")
     return EXIT_OK
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_arguments(argv)
     try:
+        if arguments.command == "verify":
+            manifest = verify_archive(arguments.snapshot.expanduser().resolve(strict=True))
+            print(f"Verification OK: {len(manifest['files'])} files; ZIP CRC and SHA-256 checks passed.")
+            return EXIT_OK
         if arguments.command == "restore":
             if arguments.mode == "full":
                 full_result = restore_full_snapshot(
@@ -1561,7 +1691,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.snapshot,
                     dry_run=arguments.dry_run,
                     overwrite=arguments.overwrite,
-                    allow_incomplete=arguments.allow_incomplete,
                 )
                 print(
                     "Full restore dry run complete."
@@ -1594,7 +1723,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.snapshot,
                 dry_run=arguments.dry_run,
                 overwrite=arguments.overwrite,
-                allow_incomplete=arguments.allow_incomplete,
             )
             print(
                 "Restore dry run complete."
@@ -1641,57 +1769,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_root,
         )
 
-        result = create_backup(
-            project_root,
-            arguments.snap_root,
-            source_root,
-        )
-        if result != EXIT_OK:
-            if arguments.compact_day or arguments.compact_month is not None:
+        archive_root = resolve_snap_root(arguments.snap_root, project_root, project_snapshot_path)
+        with project_archive_lock(archive_root / project_snapshot_path):
+            result = create_backup(
+                project_root,
+                arguments.snap_root,
+                source_root,
+            )
+            if result == EXIT_UNCHANGED:
+                return EXIT_OK
+            if result != EXIT_OK:
+                if arguments.compact_day or arguments.compact_month is not None:
+                    print(
+                        "Compaction skipped because the new snapshot is incomplete.",
+                        file=sys.stderr,
+                    )
+                return result
+
+            if arguments.compact_day:
+                compaction = compact_daily_snapshots(
+                    arguments.snap_root,
+                    project_snapshot_path,
+                    keep=arguments.keep,
+                )
+                print()
+                print("Daily compaction complete.")
+                print(f"Protected latest: {arguments.keep}")
+                print(f"Days compacted:  {compaction.compacted_days}")
+                print(f"Snapshots moved: {compaction.moved_snapshots}")
+                if compaction.moved_snapshots:
+                    purge_root = (
+                        arguments.snap_root.expanduser().resolve(strict=False)
+                        / PURGE_DIRECTORY_NAME
+                    )
+                    print(f"Purge:           {purge_root}")
+
+            if arguments.compact_month is not None:
+                monthly = compact_monthly_snapshots(
+                    arguments.snap_root,
+                    project_snapshot_path,
+                    arguments.compact_month,
+                    keep=arguments.keep,
+                )
+                print()
+                print("Monthly compaction complete.")
+                print(f"Protected latest:         {arguments.keep}")
+                print(f"Cutoff month:             {monthly.cutoff_month}")
                 print(
-                    "Compaction skipped because the new snapshot is incomplete.",
-                    file=sys.stderr,
+                    f"Months compacted:         "
+                    f"{monthly.compacted_months}"
                 )
-            return result
-
-        if arguments.compact_day:
-            compaction = compact_daily_snapshots(
-                arguments.snap_root,
-                project_snapshot_path,
-            )
-            print()
-            print("Daily compaction complete.")
-            print(f"Days compacted:  {compaction.compacted_days}")
-            print(f"Snapshots moved: {compaction.moved_snapshots}")
-            if compaction.moved_snapshots:
-                purge_root = (
-                    arguments.snap_root.expanduser().resolve(strict=False)
-                    / PURGE_DIRECTORY_NAME
-                )
-                print(f"Purge:           {purge_root}")
-
-        if arguments.compact_month is not None:
-            monthly = compact_monthly_snapshots(
-                arguments.snap_root,
-                project_snapshot_path,
-                arguments.compact_month,
-            )
-            print()
-            print("Monthly compaction complete.")
-            print(f"Cutoff month:             {monthly.cutoff_month}")
-            print(
-                f"Months compacted:         "
-                f"{monthly.compacted_months}"
-            )
-            print(f"Snapshots moved:          {monthly.moved_snapshots}")
-            if monthly.moved_snapshots:
-                purge_root = (
-                    arguments.snap_root.expanduser().resolve(strict=False)
-                    / PURGE_DIRECTORY_NAME
-                )
-                print(f"Purge:                    {purge_root}")
+                print(f"Snapshots moved:          {monthly.moved_snapshots}")
+                if monthly.moved_snapshots:
+                    purge_root = (
+                        arguments.snap_root.expanduser().resolve(strict=False)
+                        / PURGE_DIRECTORY_NAME
+                    )
+                    print(f"Purge:                    {purge_root}")
         return EXIT_OK
-    except SnapGitError as error:
+    except (SnapGitError, ArchiveError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return EXIT_ERROR
     except OSError as error:
