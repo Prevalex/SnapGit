@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import stat
 import shutil
 import struct
@@ -416,6 +417,72 @@ class SnapshotTests(unittest.TestCase):
                 sg.compact_daily_snapshots(self.archives, Path("project"))
         sg.verify_archive(first)
 
+    def test_interrupted_pair_move_rolls_back_even_after_rename(self):
+        _, archive = self.backup()
+        original_rename = Path.rename
+        def interrupt_after_zip_move(path, destination):
+            result = original_rename(path, destination)
+            if path == archive:
+                raise KeyboardInterrupt
+            return result
+        with patch.object(Path, "rename", interrupt_after_zip_move):
+            with self.assertRaises(KeyboardInterrupt):
+                sg.move_snapshots_to_purge(self.archives, [archive])
+        sg.verify_archive(archive)
+        self.assertEqual(list((self.archives / "$purge$").rglob("*.zip*")), [])
+
+    def test_console_interrupt_cleans_partial_backup_and_ignores_repeats(self):
+        _, previous = self.backup()
+        (self.repo / "tracked.txt").write_text("second", encoding="utf-8")
+        original_verify = sg.verify_archive
+        original_unlink = Path.unlink
+        signals = [signal.SIGINT]
+        if hasattr(signal, "SIGBREAK"):
+            signals.append(signal.SIGBREAK)
+        for signum in signals:
+            def interrupt_readback(path, *args, **kwargs):
+                if path.name.endswith(".partial"):
+                    self.assertTrue(sg.checksum_path(path).exists())
+                    signal.raise_signal(signum)
+                return original_verify(path, *args, **kwargs)
+            def repeat_interrupt_during_cleanup(path, *args, **kwargs):
+                if path.name.endswith(".partial"):
+                    for repeated_signal in signals:
+                        signal.raise_signal(repeated_signal)
+                return original_unlink(path, *args, **kwargs)
+            error_output = io.StringIO()
+            with self.subTest(signal=signum), contextlib.redirect_stderr(error_output), patch.object(sg, "verify_archive", side_effect=interrupt_readback), patch.object(Path, "unlink", repeat_interrupt_during_cleanup), patch.object(sg, "compact_daily_snapshots") as daily, patch.object(sg, "compact_monthly_snapshots") as monthly:
+                self.assertEqual(sg.main(["backup", str(self.repo), "-sr", str(self.archives), "-cd", "-cm", "0"]), sg.EXIT_ERROR)
+                daily.assert_not_called()
+                monthly.assert_not_called()
+            self.assertEqual(error_output.getvalue().strip(), "ERROR: Interrupted by user.")
+            self.assertFalse((self.archives / "project" / ".snapgit.lock").exists())
+            self.assertEqual(list(self.archives.rglob("*.partial*")), [])
+            self.assertEqual(list(self.archives.rglob("*.zip")), [previous])
+            self.assertEqual(list(self.archives.rglob("*.sha256")), [sg.checksum_path(previous)])
+            sg.verify_archive(previous)
+
+    def test_interrupted_restore_preserves_destination_and_cleans_temporary_files(self):
+        (self.repo / "extra.txt").write_text("saved", encoding="utf-8")
+        _, archive = self.backup()
+        target = self.clone()
+        destination = target / "extra.txt"
+        destination.write_text("existing", encoding="utf-8")
+        staging = []
+        original_verify = sg.verify_archive
+        def record_staging(path, extraction_root=None):
+            staging.append(extraction_root)
+            return original_verify(path, extraction_root)
+        def interrupt_copy(source, output, length):
+            output.write(source.read(1))
+            signal.raise_signal(signal.SIGINT)
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(sg, "verify_archive", side_effect=record_staging), patch.object(shutil, "copyfileobj", side_effect=interrupt_copy):
+            self.assertEqual(sg.main(["restore", str(target), "--snapshot", str(archive), "--overwrite"]), sg.EXIT_ERROR)
+        self.assertEqual(destination.read_text(encoding="utf-8"), "existing")
+        self.assertEqual(list(target.rglob(".snapgit-*")), [])
+        self.assertEqual(len(staging), 1)
+        self.assertFalse(staging[0].exists())
+
     def test_failed_publish_preserves_previous_backup(self):
         _, first = self.backup()
         (self.repo / "tracked.txt").write_text("second", encoding="utf-8")
@@ -485,6 +552,34 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((target / name).read_bytes(), b"raw filename")
         self.assertEqual((target / "script").stat().st_mode & 0o777, 0o751)
         self.assertTrue((target / "link").is_symlink())
+
+
+class ConsoleInterruptTests(unittest.TestCase):
+    def console_handlers(self):
+        return {signum: signal.getsignal(signum)
+                for name in ("SIGINT", "SIGBREAK")
+                if (signum := getattr(signal, name, None)) is not None}
+
+    def test_console_signals_interrupt_argument_parsing_and_restore_handlers(self):
+        previous = self.console_handlers()
+        for signum in previous:
+            def interrupt_parsing(argv):
+                signal.raise_signal(signum)
+            error_output = io.StringIO()
+            with self.subTest(signal=signum), contextlib.redirect_stderr(error_output), patch.object(sg, "parse_arguments", side_effect=interrupt_parsing):
+                self.assertEqual(sg.main([]), sg.EXIT_ERROR)
+            self.assertEqual(error_output.getvalue().strip(), "ERROR: Interrupted by user.")
+            self.assertEqual(self.console_handlers(), previous)
+
+    def test_handlers_are_restored_after_success_or_argparse_exit(self):
+        previous = self.console_handlers()
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(sg, "verify_archive", return_value={"files": []}):
+            self.assertEqual(sg.main(["verify", sg.__file__]), sg.EXIT_OK)
+        self.assertEqual(self.console_handlers(), previous)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            sg.main(["--version"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(self.console_handlers(), previous)
 
 
 class StatSignatureTests(unittest.TestCase):

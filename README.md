@@ -170,6 +170,12 @@ Failed or interrupted operations do not publish a complete snapshot or start
 compaction. A process or system crash may leave `.partial` files or an orphan
 checksum; these are not treated as completed snapshots.
 
+Ctrl-C, and Ctrl-Break on Windows, stop the command with `Interrupted by user`
+and exit code `1`. Temporary files and the project lock are cleaned up; repeated
+keypresses are ignored during cleanup. An interrupted compaction rolls back its
+file moves. An interrupted restore may leave already applied changes in place;
+it does not roll back the whole working tree.
+
 Verify an existing snapshot without restoring or writing its contents to disk:
 
 ```console

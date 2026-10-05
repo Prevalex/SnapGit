@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1020,15 +1021,19 @@ def move_snapshots_to_purge(
             if not source.is_file():
                 raise SnapGitError(f"Compaction requires the archive and checksum: {source}")
             moves.append((source, destination))
-    completed = []
+    attempted = []
     try:
         for source, destination in moves:
             destination.parent.mkdir(parents=True, exist_ok=True)
+            # Record before rename: a signal can arrive immediately after it.
+            attempted.append((source, destination))
             source.rename(destination)
-            completed.append((source, destination))
-    except OSError as error:
-        for source, destination in reversed(completed):
-            destination.rename(source)
+    except (OSError, KeyboardInterrupt) as error:
+        for source, destination in reversed(attempted):
+            if not source.exists():
+                destination.rename(source)
+        if isinstance(error, KeyboardInterrupt):
+            raise
         raise SnapGitError(f"Could not compact snapshots: {error}") from error
     return len(moves) // 2
 
@@ -1687,8 +1692,21 @@ def create_backup(project_root_argument: Path, snap_root_argument: Path,
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = parse_arguments(argv)
+    """Run the CLI on the main thread, restoring its console signal handlers."""
+    previous_handlers = {}
+
+    def handle_interrupt(signum, frame):
+        # Repeated keypresses must not interrupt finally blocks or rollback.
+        for handled_signal in previous_handlers:
+            signal.signal(handled_signal, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
     try:
+        for name in ("SIGINT", "SIGBREAK"):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                previous_handlers[signum] = signal.signal(signum, handle_interrupt)
+        arguments = parse_arguments(argv)
         if arguments.command == "verify":
             manifest = verify_archive(arguments.snapshot.expanduser().resolve(strict=True))
             print(f"Verification OK: {len(manifest['files'])} files; ZIP CRC and SHA-256 checks passed.")
@@ -1845,6 +1863,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("ERROR: Interrupted by user.", file=sys.stderr)
         return EXIT_ERROR
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

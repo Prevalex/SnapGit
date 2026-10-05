@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Handle Ctrl-C and Windows Ctrl-Break with cleanup and exit code 1; ignore
+  repeated interrupts during cleanup and roll back interrupted compaction moves.
+
 ## 0.1.0 — 2026-09-28
 
 Initial testing release. PyPI distribution files are prepared but are not published.
